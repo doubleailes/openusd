@@ -44,7 +44,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Cursor, Write};
 use std::path::Path as FsPath;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::{ar, sdf, tf};
 
@@ -94,10 +94,10 @@ pub struct Layer {
     /// Per-layer change sinks fired at the commit seam — the low tier of the
     /// change pipeline, where a stage installs an aggregator so it stays in sync
     /// with any edit. Empty by default.
-    sinks: sink::Set<dyn LayerSink>,
+    sinks: sink::Exclusive<sink::Set<dyn LayerSink>>,
     /// The resolver the layer was opened through, which a save reopens the
     /// saved file with. `None` for a layer that was not read from an asset.
-    resolver: Option<Rc<dyn ar::Resolver>>,
+    resolver: Option<Arc<dyn ar::Resolver>>,
 }
 
 impl Layer {
@@ -161,7 +161,7 @@ impl Layer {
         identifier: impl Into<String>,
         real_path: &ar::ResolvedPath,
         data: LayerData,
-        resolver: Rc<dyn ar::Resolver>,
+        resolver: Arc<dyn ar::Resolver>,
     ) -> Self {
         let identifier = identifier.into();
         let real_path = real_path.to_string();
@@ -179,7 +179,7 @@ impl Layer {
             real_path,
             data: CowData::new(data),
             changes: ChangeList::new(),
-            sinks: sink::Set::default(),
+            sinks: sink::Exclusive::new(sink::Set::default()),
             resolver: None,
         }
     }
@@ -191,12 +191,12 @@ impl Layer {
     /// `Fn(&str, &ChangeList)` closure is a `LayerSink`, so this takes either a
     /// full sink type or a closure observer.
     pub fn add_sink<S: LayerSink + 'static>(&mut self, sink: S) -> LayerSinkId {
-        self.sinks.add(Box::new(sink))
+        self.sinks.get_mut().add(Box::new(sink))
     }
 
     /// Remove the layer sink with `id`; a no-op if it was already removed.
     pub fn remove_sink(&mut self, id: LayerSinkId) {
-        self.sinks.remove(id);
+        self.sinks.get_mut().remove(id);
     }
 
     /// Borrow the layer's data as a read-only [`AbstractData`]. Reads see the
@@ -265,7 +265,7 @@ impl Layer {
     /// backend.
     fn prepare_commit(&mut self, generation: u64) -> Result<(), sink::Error> {
         self.changes.update(&self.data);
-        if !self.changes.is_empty() && !self.sinks.is_empty() {
+        if !self.changes.is_empty() && !self.sinks.get_mut().is_empty() {
             let change = PendingLayerChange {
                 layer_identifier: &self.identifier,
                 base: &**self.data.base(),
@@ -273,7 +273,10 @@ impl Layer {
                 change_list: &self.changes,
                 generation,
             };
-            self.sinks.iter().try_for_each(|sink| sink.before_commit(&change))?;
+            self.sinks
+                .get_mut()
+                .iter()
+                .try_for_each(|sink| sink.before_commit(&change))?;
         }
         Ok(())
     }
@@ -292,9 +295,9 @@ impl Layer {
     /// [`prepare_commit`](Self::prepare_commit) derived. Run only after every layer
     /// in a group has committed its data, so a panicking sink cannot strand a
     /// partially committed group.
-    fn notify_after_commit(&self) {
+    fn notify_after_commit(&mut self) {
         if !self.changes.is_empty() {
-            for sink in self.sinks.iter() {
+            for sink in self.sinks.get_mut().iter() {
                 sink.after_commit(&self.identifier, &self.changes);
             }
         }
@@ -1146,7 +1149,7 @@ pub(crate) fn edit_layers<E: From<sink::Error>>(
     guard.committed = true;
     // Phase 3: deliver each layer's `after_commit`. A panic here interrupts only
     // notification — the group's data is already committed.
-    for layer in guard.layers.iter() {
+    for layer in guard.layers.iter_mut() {
         layer.notify_after_commit();
     }
     Ok(changed)
@@ -1195,13 +1198,13 @@ mod tests {
     use super::*;
     use crate::Result;
 
-    use std::cell::{Cell, RefCell};
+    use std::cell::Cell;
     use std::fs;
     use std::io;
     use std::path::PathBuf;
     use std::rc::Rc;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use crate::sdf;
     use crate::usda;
@@ -2578,8 +2581,8 @@ mod tests {
 
     /// Puts `layer` behind a resolver that opens every asset to what `open`
     /// gives, as if the layer had been read through it.
-    fn opened_through(layer: &mut Layer, open: impl Fn() -> io::Result<Box<dyn ar::Asset>> + 'static) {
-        layer.resolver = Some(Rc::new(ar::tests::TestResolver(open)));
+    fn opened_through(layer: &mut Layer, open: impl Fn() -> io::Result<Box<dyn ar::Asset>> + Send + Sync + 'static) {
+        layer.resolver = Some(Arc::new(ar::tests::TestResolver(open)));
     }
 
     /// The crate fixture in `dir`, read into memory and edited, with its
@@ -2595,15 +2598,20 @@ mod tests {
     /// for a mapping when `mapping` is set, and for bytes in memory
     /// otherwise. `sources` collects a handle that is shared with each
     /// source made; its count tells whether a view of the source lives.
-    fn shared_asset(bytes: Vec<u8>, mapping: bool, sources: &RefCell<Vec<ar::tests::AdviceLog>>) -> Box<dyn ar::Asset> {
+    fn shared_asset(bytes: Vec<u8>, mapping: bool, sources: &Mutex<Vec<ar::tests::AdviceLog>>) -> Box<dyn ar::Asset> {
         let (buffer, log) = ar::tests::recording_source(bytes, mapping);
-        sources.borrow_mut().push(log);
+        sources.lock().unwrap().push(log);
         Box::new(io::Cursor::new(ar::AssetBuffer::Shared(buffer)))
     }
 
     /// How many of `sources` a view still holds alive.
-    fn live_sources(sources: &RefCell<Vec<ar::tests::AdviceLog>>) -> usize {
-        sources.borrow().iter().filter(|log| Arc::strong_count(log) > 1).count()
+    fn live_sources(sources: &Mutex<Vec<ar::tests::AdviceLog>>) -> usize {
+        sources
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|log| Arc::strong_count(log) > 1)
+            .count()
     }
 
     /// A save through the registry puts the layer on the mapping the
@@ -2612,14 +2620,14 @@ mod tests {
     fn save_remaps() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let (path, mut layer) = edited_fixture(dir.path())?;
-        let sources = Rc::new(RefCell::new(Vec::new()));
+        let sources = Arc::new(Mutex::new(Vec::new()));
         opened_through(&mut layer, {
-            let (path, sources) = (path.clone(), Rc::clone(&sources));
+            let (path, sources) = (path.clone(), Arc::clone(&sources));
             move || Ok(shared_asset(fs::read(&path)?, true, &sources))
         });
 
         layer.save()?;
-        assert_eq!(sources.borrow().len(), 1, "the saved file is opened once");
+        assert_eq!(sources.lock().unwrap().len(), 1, "the saved file is opened once");
         assert_eq!(live_sources(&sources), 1, "the layer holds the mapping");
         assert_eq!(world_kind(&layer), Some(tf::Token::from("component")));
         let size = layer.data().get_field(&Path::new("/World.size")?, "default")?;
@@ -2640,14 +2648,14 @@ mod tests {
             move |_: &str, _: &ChangeList| fired.set(fired.get() + 1)
         });
         let before = fs::read(&path)?;
-        let sources = Rc::new(RefCell::new(Vec::new()));
+        let sources = Arc::new(Mutex::new(Vec::new()));
         opened_through(&mut layer, {
-            let sources = Rc::clone(&sources);
+            let sources = Arc::clone(&sources);
             move || Ok(shared_asset(before.clone(), true, &sources))
         });
 
         layer.save()?;
-        assert_eq!(sources.borrow().len(), 1);
+        assert_eq!(sources.lock().unwrap().len(), 1);
         assert_eq!(live_sources(&sources), 0, "the stale mapping is let go");
         assert_eq!(world_kind(&layer), Some(tf::Token::from("component")));
         assert_eq!(fired.get(), 0, "a save is not a layer change");
@@ -2664,14 +2672,14 @@ mod tests {
     fn save_skips_heap() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let (path, mut layer) = edited_fixture(dir.path())?;
-        let sources = Rc::new(RefCell::new(Vec::new()));
+        let sources = Arc::new(Mutex::new(Vec::new()));
         opened_through(&mut layer, {
-            let sources = Rc::clone(&sources);
+            let sources = Arc::clone(&sources);
             move || Ok(shared_asset(fs::read(&path)?, false, &sources))
         });
 
         layer.save()?;
-        assert_eq!(sources.borrow().len(), 1);
+        assert_eq!(sources.lock().unwrap().len(), 1);
         assert_eq!(live_sources(&sources), 0);
         assert_eq!(world_kind(&layer), Some(tf::Token::from("component")));
         Ok(())
@@ -2705,11 +2713,11 @@ mod tests {
 
         let dir = tempfile::tempdir()?;
         let (path, mut layer) = edited_fixture(dir.path())?;
-        let (opens, reads) = (Rc::new(Cell::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (opens, reads) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
         opened_through(&mut layer, {
-            let (opens, reads) = (Rc::clone(&opens), Arc::clone(&reads));
+            let (opens, reads) = (Arc::clone(&opens), Arc::clone(&reads));
             move || {
-                opens.set(opens.get() + 1);
+                opens.fetch_add(1, Ordering::Relaxed);
                 Ok(Box::new(Counting(
                     io::Cursor::new(fs::read(&path)?),
                     Arc::clone(&reads),
@@ -2718,7 +2726,7 @@ mod tests {
         });
 
         layer.save()?;
-        assert_eq!(opens.get(), 1);
+        assert_eq!(opens.load(Ordering::Relaxed), 1);
         assert_eq!(reads.load(Ordering::Relaxed), 0);
         assert_eq!(world_kind(&layer), Some(tf::Token::from("component")));
         Ok(())
@@ -2745,11 +2753,11 @@ mod tests {
     fn save_replace_failure() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let (path, mut layer) = edited_fixture(dir.path())?;
-        let opens = Rc::new(Cell::new(0));
+        let opens = Arc::new(AtomicUsize::new(0));
         opened_through(&mut layer, {
-            let opens = Rc::clone(&opens);
+            let opens = Arc::clone(&opens);
             move || {
-                opens.set(opens.get() + 1);
+                opens.fetch_add(1, Ordering::Relaxed);
                 Err(io::Error::from(io::ErrorKind::NotFound))
             }
         });
@@ -2758,7 +2766,7 @@ mod tests {
 
         let error = layer.save().expect_err("the replacement fails");
         assert!(matches!(error, ExportError::Replace { .. }), "{error:?}");
-        assert_eq!(opens.get(), 0);
+        assert_eq!(opens.load(Ordering::Relaxed), 0);
         assert_eq!(world_kind(&layer), Some(tf::Token::from("component")));
         Ok(())
     }

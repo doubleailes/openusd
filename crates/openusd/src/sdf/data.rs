@@ -21,7 +21,7 @@ use crate::sdf::{Path, SpecData, SpecType, Value};
 /// ([`PrimSpec`](crate::sdf::PrimSpec) and friends) are a higher-tier
 /// convenience layered on top of this interface, paralleling how `SdfPrimSpec`
 /// sits above `SdfAbstractData`.
-pub trait AbstractData {
+pub trait AbstractData: Send + Sync {
     /// Returns `true` if this data has a spec for the given path.
     fn has_spec(&self, path: &Path) -> bool;
 

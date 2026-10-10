@@ -63,6 +63,34 @@ impl<K: ?Sized> fmt::Debug for Id<K> {
     }
 }
 
+/// A value reachable only through `&mut`, which is therefore `Sync` whatever it
+/// holds: a shared reference to it cannot touch the value from any thread.
+/// A layer keeps its sinks in one, so a `&Layer` can cross threads while a sink
+/// (the stage's aggregator holds an `Rc`) stays single-threaded.
+//
+// TODO: replace with `std::sync::SyncView` once it is stable.
+pub(crate) struct Exclusive<T: ?Sized>(T);
+
+impl<T> Exclusive<T> {
+    /// Wraps `value`.
+    pub(crate) fn new(value: T) -> Self {
+        Self(value)
+    }
+}
+
+impl<T: ?Sized> Exclusive<T> {
+    /// The value, through the exclusive access that guards it.
+    pub(crate) fn get_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
+
+// SAFETY: no method hands out `&T` from a `&Exclusive<T>`; the value is only
+// reached through `get_mut`, whose `&mut self` proves no other reference to the
+// wrapper is live on any thread.
+#[allow(unsafe_code)]
+unsafe impl<T: ?Sized> Sync for Exclusive<T> {}
+
 /// An ordered set of installed sinks keyed by an [`Id`] — the add / remove /
 /// iterate machinery shared by the layer-tier and stage-tier sink registries.
 /// Generic over the (unsized) sink trait object type `T`, so the same logic

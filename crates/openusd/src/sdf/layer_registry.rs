@@ -19,7 +19,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::ar;
 use crate::sdf::{self, expr};
@@ -143,7 +143,7 @@ impl From<LoadError> for crate::Error {
 /// grow a ref-counted loaded-layer cache (`find_or_open` dedup) and custom
 /// format registration.
 pub struct LayerRegistry {
-    resolver: Rc<dyn ar::Resolver>,
+    resolver: Arc<dyn ar::Resolver>,
 }
 
 /// A layer as [`LayerRegistry::open`] reads it: its canonical identifier,
@@ -171,7 +171,7 @@ impl LayerRegistry {
     /// A registry resolving asset paths through `resolver`.
     pub fn new(resolver: Box<dyn ar::Resolver>) -> Self {
         Self {
-            resolver: Rc::from(resolver),
+            resolver: Arc::from(resolver),
         }
     }
 
@@ -339,7 +339,7 @@ impl LayerRegistry {
     pub(crate) fn open_layer(&self, identifier: &str) -> Result<Option<sdf::Layer>, LoadError> {
         Ok(self
             .open(identifier)?
-            .map(|layer| sdf::Layer::new_resolved(identifier, &layer.resolved, layer.data, Rc::clone(&self.resolver))))
+            .map(|layer| sdf::Layer::new_resolved(identifier, &layer.resolved, layer.data, Arc::clone(&self.resolver))))
     }
 
     /// Reads the single layer at `asset_path` (anchored against `anchor`)
@@ -562,7 +562,7 @@ impl LayerRegistry {
                 identifier.clone(),
                 &resolved,
                 data,
-                Rc::clone(&self.resolver),
+                Arc::clone(&self.resolver),
             ));
         }
 
@@ -734,7 +734,7 @@ pub(crate) mod tests {
             identifier,
             &resolved,
             data,
-            Rc::clone(&registry.resolver),
+            Arc::clone(&registry.resolver),
         ));
         Ok(())
     }

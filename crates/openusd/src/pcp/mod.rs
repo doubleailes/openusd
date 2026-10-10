@@ -357,6 +357,9 @@ pub(crate) mod layer_graph;
 pub(crate) mod layer_stack;
 pub(crate) mod load_rules;
 mod mapping;
+mod par;
+#[doc(hidden)]
+pub use par::stats as par_stats;
 pub(crate) mod population_mask;
 pub(crate) mod prim_graph;
 pub(crate) mod prim_index;

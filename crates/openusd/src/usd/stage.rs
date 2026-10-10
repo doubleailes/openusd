@@ -3483,6 +3483,9 @@ impl Stage {
         // its inherited bits from that status and its own opinions, as C++
         // `Usd_PrimData` does; after a change it walks its ancestors afresh.
         let mut stack = vec![(sdf::Path::abs_root(), None)];
+        if std::env::var("PROBE_SUBTREE").is_ok() {
+            self.with_cache(|g, cache| cache.compose_subtree(g, &sdf::Path::abs_root()))?;
+        }
 
         while let Some((path, parent)) = stack.pop() {
             let epoch = self.population_epoch();
@@ -3510,11 +3513,16 @@ impl Stage {
             };
 
             let children = self.masked(&path, |g, cache| cache.prim_children(g, &path))?;
+            let children: Vec<sdf::Path> = children
+                .iter()
+                .filter_map(|name| path.append_path(name.as_str()).ok())
+                .collect();
+            // Every child's status is read next, which composes it: compose the
+            // siblings together.
+            self.with_cache(|g, cache| cache.ensure_indices(g, &children))?;
             // Push in reverse so first child is visited first.
-            for name in children.iter().rev() {
-                if let Ok(child) = path.append_path(name.as_str()) {
-                    stack.push((child, Some((epoch, status))));
-                }
+            for child in children.into_iter().rev() {
+                stack.push((child, Some((epoch, status))));
             }
         }
 

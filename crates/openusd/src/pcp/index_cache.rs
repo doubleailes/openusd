@@ -28,6 +28,7 @@ use super::instancing::PrototypeRegistry;
 use super::layer_graph::{LayerGraph, LayerStackIdentifier};
 use super::layer_stack::StackMarks;
 use super::load_rules::LoadRules;
+use super::par;
 use super::population_mask::PopulationMask;
 use super::prim_graph::ArcType;
 use super::prim_index::{
@@ -1050,6 +1051,20 @@ impl OpinionResolver for StackResolver<'_> {
         }
         Ok(Step::Continue)
     }
+}
+
+/// A prim index composed off the cache by [`IndexCache::compose`], with what
+/// caching it records beside it.
+struct BuiltPrim {
+    index: PrimIndex,
+    /// The context the prim's children compose under.
+    context: CompositionContext,
+    /// The recoverable errors the build recorded.
+    errors: Diagnostics,
+    /// The inconsistent property types the prim composes.
+    property_errors: Diagnostics,
+    /// The per-stack expression variables the build read.
+    expr_var_deps: ExprVarDeps,
 }
 
 #[cfg(test)]
@@ -3121,7 +3136,85 @@ impl IndexCache {
         {
             self.precache_path(graph, &parent);
         }
+        let (composed, pending_loads) = self.compose(graph, path)?;
+        self.pending_loads.extend(pending_loads);
+        // A reference/payload arc demanded a layer that is not yet loaded — here,
+        // or in a pre-cached ancestor that then seeded this build incompletely —
+        // so this index is incomplete: leave `path` uncached for the stage's query
+        // loop to load and recompose. Returning before `commit` keeps a
+        // partial index — and the transient errors composed without the missing
+        // layer — out of the cache entirely.
+        if self.awaits_load(pending_before) {
+            return Ok(());
+        }
+        self.commit(graph, path, composed);
+        Ok(())
+    }
 
+    /// Builds and caches the index of every path in `paths` whose parent is
+    /// already cached, composing them concurrently and caching the results in
+    /// order. A path that is cached, has an uncached parent, or lies in an
+    /// unregistered prototype is skipped, as is one whose build demanded a
+    /// not-yet-loaded layer (its demands join [`pending_loads`](Self::pending_loads)
+    /// for the stage's query loop, as through [`ensure_index`](Self::ensure_index)).
+    pub(crate) fn ensure_indices(&mut self, graph: &LayerGraph, paths: &[Path]) -> Result<(), QueryError> {
+        let mut effective = Vec::with_capacity(paths.len());
+        let mut seen = HashSet::with_capacity(paths.len());
+        for path in paths {
+            let path = self.effective_path(graph, path)?;
+            if seen.insert(path.clone()) {
+                effective.push(path);
+            }
+        }
+        let ready: Vec<&Path> = effective
+            .iter()
+            .filter(|path| {
+                !path.is_empty()
+                    && !self.is_indexed(path)
+                    && !self.in_unregistered_prototype(path)
+                    && path.parent().is_some_and(|p| p.is_abs_root() || self.is_indexed(&p))
+            })
+            .collect();
+        let this = &*self;
+        let built = par::map(&ready, |path| this.compose(graph, path));
+        for (path, result) in ready.into_iter().zip(built) {
+            let (composed, pending_loads) = result?;
+            if pending_loads.is_empty() {
+                self.commit(graph, path, composed);
+            } else {
+                self.pending_loads.extend(pending_loads);
+            }
+        }
+        Ok(())
+    }
+
+    /// PROBE: composes the subtree under `root` one namespace level at a time,
+    /// each level as one [`ensure_indices`](Self::ensure_indices) batch.
+    pub(crate) fn compose_subtree(&mut self, graph: &LayerGraph, root: &Path) -> Result<(), QueryError> {
+        let mut frontier = vec![root.clone()];
+        while !frontier.is_empty() {
+            let mut next = Vec::new();
+            for parent in &frontier {
+                if !parent.is_abs_root() && !self.is_indexed(parent) {
+                    continue;
+                }
+                for name in self.prim_children(graph, parent)? {
+                    if let Ok(child) = parent.append_path(name.as_str()) {
+                        next.push(child);
+                    }
+                }
+            }
+            self.ensure_indices(graph, &next)?;
+            frontier = next;
+        }
+        Ok(())
+    }
+
+    /// Composes the index for `path` against the cached parent, without caching
+    /// it: the pure half of a build, safe to run for several paths at once. The
+    /// second element is the layers the build demanded; when it is non-empty the
+    /// index is incomplete and must not be committed.
+    fn compose(&self, graph: &LayerGraph, path: &Path) -> Result<(BuiltPrim, Vec<Demand>), QueryError> {
         let parent_ctx = path
             .parent()
             .and_then(|p| self.store.context_at(&p))
@@ -3133,30 +3226,8 @@ impl IndexCache {
         // `LoadRules::effective_rule`'s lookahead).
         let load_payloads = self.is_loaded(path);
 
-        // TODO(rayon): a build reads `graph`, `&parent_ctx` and the parent's
-        // cached entry, and nothing else from the store. Every prim whose parent
-        // is cached therefore composes independently, as do the instance check,
-        // the child context and the property-type scan below, which read only
-        // the new index. The batch to fan out is a whole namespace level, cached
-        // in order afterwards through `&mut self`: one prim's children are too
-        // few to pay for waking the worker threads. Two things block it.
-        // `LayerGraph` is not `Sync`: `ar::Resolver` and `sdf::AbstractData`
-        // carry no `Send + Sync` bound, and each layer owns its sinks, which the
-        // stage's aggregator keeps single-threaded. And every prim still pays
-        // two serial steps on this thread: `IndexStore::insert` here, and the
-        // child-name composition a traversal asks for next.
-        let (mut index, mut build_errors, pending_loads, mut expr_var_deps) =
+        let (mut index, build_errors, pending_loads, mut expr_var_deps) =
             PrimIndex::build_with_cache(path, graph, &parent_ctx, self.store.entries(), load_payloads)?;
-        self.pending_loads.extend(pending_loads);
-        // A reference/payload arc demanded a layer that is not yet loaded — here,
-        // or in a pre-cached ancestor that then seeded this build incompletely —
-        // so this index is incomplete: leave `path` uncached for the stage's query
-        // loop to load and recompose. Returning before `cache_index` keeps a
-        // partial index — and the transient errors composed without the missing
-        // layer — out of the cache entirely.
-        if self.awaits_load(pending_before) {
-            return Ok(());
-        }
         // Retain recoverable composition errors recorded during the build (e.g.
         // an unresolvable arc). An invalid opinion at a
         // relocation source is reported "while composing" this prim, so stamp its
@@ -3166,7 +3237,7 @@ impl IndexCache {
         // Rebuilt through the collection, since stamping can make two
         // diagnostics from different sub-builds equal and only a re-insertion
         // applies uniqueness to the stamped values.
-        build_errors = build_errors
+        let errors = build_errors
             .into_iter()
             .map(|mut error| {
                 match &mut error {
@@ -3178,7 +3249,7 @@ impl IndexCache {
                 error
             })
             .collect();
-        // `build_errors` accumulates every error for this prim and is carried
+        // `errors` accumulates every error for this prim and is carried
         // into the prim's cache entry at the end, replacing any prior entry, so
         // a rebuild never duplicates and a fixed prim drops its stale errors.
 
@@ -3217,28 +3288,51 @@ impl IndexCache {
         // selection no indexing-time task did — one authored here for a set
         // declared only on a descendant — so its reads merge into this prim's
         // dependency map before it registers.
-        let (mut child_context, context_deps) = index.context_for_children(graph, &parent_ctx);
+        let (mut context, context_deps) = index.context_for_children(graph, &parent_ctx);
         expr_var_deps.merge(context_deps);
         // A nested instance re-arms the depth to its own (deeper) level, so an
         // inner instance's descendants drop opinions above its instanceable arc
         // rather than the outer instance's.
-        child_context.instance_depth = if is_instance {
+        context.instance_depth = if is_instance {
             Some(path.prim_element_count() as u16)
         } else {
             parent_ctx.instance_depth
         };
-        self.cache_index(graph, path, index, child_context, build_errors, expr_var_deps);
         // Report inconsistent property types at prim composition (C++
         // `PcpErrorInconsistentPropertyType`) so the conflict is visible without
-        // anyone asking for a property stack. Composed property names read back
-        // through the store, so this runs after the entry is cached and reports
-        // onto it.
+        // anyone asking for a property stack.
         // TODO(perf): this composes property names on every prim build to find a
         // rare conflict; gate it on a cheaper signal (e.g. a node carrying both
         // attribute and relationship specs) before scanning.
-        let names = self.composed_property_names(graph, path)?;
-        self.report_property_type_conflicts(graph, path, &names);
-        Ok(())
+        let mut property_errors = Diagnostics::default();
+        for name in property_names_of(graph, &index) {
+            if let Ok(property) = path.append_property(&name) {
+                property_errors.extend(Self::property_type_conflicts(graph, &index, path, &property));
+            }
+        }
+        let composed = BuiltPrim {
+            index,
+            context,
+            errors,
+            property_errors,
+            expr_var_deps,
+        };
+        Ok((composed, pending_loads))
+    }
+
+    /// Caches a prim [`compose`](Self::compose) built, with the property-type
+    /// conflicts it found recorded on the entry.
+    fn commit(&mut self, graph: &LayerGraph, path: &Path, composed: BuiltPrim) {
+        let BuiltPrim {
+            index,
+            context,
+            errors,
+            property_errors,
+            expr_var_deps,
+        } = composed;
+        self.cache_index(graph, path, index, context, errors, expr_var_deps);
+        let cached = self.store.replace_property_errors(path, property_errors);
+        debug_assert!(cached, "property conflicts recorded against an uncached prim: {path}");
     }
 
     /// Ensures a path and all its ancestors are cached (built on the fly if needed).
@@ -3270,30 +3364,33 @@ impl IndexCache {
     /// properties with no separate target rediscovery.
     fn composed_property_names(&mut self, graph: &LayerGraph, path: &Path) -> Result<Vec<Token>, QueryError> {
         self.ensure_index(graph, path)?;
-
-        let index = self.cached(path);
-        let mut result: Vec<Token> = Vec::new();
-        let mut seen: HashSet<Token> = HashSet::new();
-
-        // Fold weakest-to-strongest across both nodes and, within each node, its
-        // layers: contributing nodes in reverse strength order, and `layer_stack()`
-        // (strongest first) reversed in place. `seen` dedups names in O(1) while
-        // `result` preserves the weakest-position order.
-        for node in index.nodes().rev() {
-            for &(layer, _) in graph.layer_stack(node.layer_stack_id()).iter().rev() {
-                let layer_data = graph.layer(layer);
-                append_unseen_names(
-                    layer_data,
-                    &node.path,
-                    ChildrenKey::PropertyChildren,
-                    &mut result,
-                    &mut seen,
-                );
-            }
-        }
-
-        Ok(result)
+        Ok(property_names_of(graph, self.cached(path)))
     }
+}
+
+/// Composes the property names `index` contributes, the fold behind
+/// [`IndexCache::composed_property_names`].
+fn property_names_of(graph: &LayerGraph, index: &PrimIndex) -> Vec<Token> {
+    let mut result: Vec<Token> = Vec::new();
+    let mut seen: HashSet<Token> = HashSet::new();
+
+    // Fold weakest-to-strongest across both nodes and, within each node, its
+    // layers: contributing nodes in reverse strength order, and `layer_stack()`
+    // (strongest first) reversed in place. `seen` dedups names in O(1) while
+    // `result` preserves the weakest-position order.
+    for node in index.nodes().rev() {
+        for &(layer, _) in graph.layer_stack(node.layer_stack_id()).iter().rev() {
+            let layer_data = graph.layer(layer);
+            append_unseen_names(
+                layer_data,
+                &node.path,
+                ChildrenKey::PropertyChildren,
+                &mut result,
+                &mut seen,
+            );
+        }
+    }
+    result
 }
 
 /// Appends a layer's not-yet-seen `field` children (`primChildren` /
