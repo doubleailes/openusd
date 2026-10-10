@@ -31,8 +31,7 @@ use super::load_rules::LoadRules;
 use super::population_mask::PopulationMask;
 use super::prim_graph::ArcType;
 use super::prim_index::{
-    AncestorArc, CompositionContext, Demand, NodeRuns, PrimIndex, PropertyTargetKind, SiteScope, TargetMemo,
-    TargetMemoKey,
+    CompositionContext, Demand, NodeRuns, PrimIndex, PropertyTargetKind, SiteScope, TargetMemo, TargetMemoKey,
 };
 use super::prim_indexer::ExprVarDeps;
 use super::prim_resolve::{
@@ -148,14 +147,6 @@ pub struct IndexCache {
     /// diagnostic on every call — the walk that produces it is the one the
     /// caller asked for — which the collection folds back into one report.
     query_diagnostics: Diagnostics,
-    /// Paths whose [`ensure_index`](Self::ensure_index) call is still on the
-    /// stack. Pre-caching an inherit/specialize target (and that target's own
-    /// targets) re-enters `ensure_index`; a cyclic class hierarchy (e.g. two
-    /// prims that inherit each other) would otherwise recurse forever before any
-    /// of them is cached. Re-entry for an in-progress path
-    /// returns early, so the cycle-closing arc simply finds no cached target and
-    /// drops out of composition.
-    in_progress: HashSet<Path>,
     /// [`Demand`]s a build raised for a target layer that is not yet loaded,
     /// returned up from the indexer (via `BuildOutput`) and accumulated here
     /// across the builds run in a pass. [`Stage::with_cache`](crate::usd::Stage)
@@ -1096,7 +1087,6 @@ impl IndexCache {
             type_opinion_epoch: 0,
             collection_diagnostics,
             query_diagnostics: Diagnostics::default(),
-            in_progress: HashSet::new(),
             pending_loads: Vec::new(),
         }
     }
@@ -3080,93 +3070,6 @@ impl IndexCache {
         Ok(self.cached(&path).variant_selections())
     }
 
-    /// Collects ancestor arcs from all cached ancestors of `path`.
-    ///
-    /// Returns references into the cached contexts, avoiding allocation
-    /// of `AncestorArc` (which contains `MapFunction` with a `Vec`).
-    fn collect_ancestor_arcs(&self, path: &Path) -> Vec<&AncestorArc> {
-        let mut arcs = Vec::new();
-        let mut p = Some(path.clone());
-        while let Some(pp) = p {
-            if let Some(ctx) = self.store.context_at(&pp) {
-                arcs.extend(&ctx.ancestor_arcs);
-            }
-            p = pp.parent();
-        }
-        arcs
-    }
-
-    /// Pre-caches inherit/specialize targets declared in the prim's layer
-    /// data. Reads inherit paths from each layer, resolves them to composed
-    /// namespace using ancestor arcs, and ensures those targets are cached.
-    fn precache_inherit_targets(&mut self, graph: &LayerGraph, path: &Path) {
-        let Some(parent) = path.parent() else {
-            return;
-        };
-        let Some(parent_index) = self.store.index_at(&parent) else {
-            return;
-        };
-
-        let ancestor_arcs = self.collect_ancestor_arcs(&parent);
-
-        // Scan each parent composition node for inherit/specialize targets: the
-        // parent's own path in that node's namespace, and the prim's path there
-        // (the node's path extended by the prim name). A layer that authors the
-        // prim directly contributes to the parent at the parent path, so it is
-        // already covered here — no separate all-layers scan of the prim path is
-        // needed.
-        let mut nodes_to_scan: Vec<(Path, LayerId)> = Vec::new();
-        for node in parent_index.nodes() {
-            for &(layer, _) in graph.layer_stack(node.layer_stack_id()).iter() {
-                nodes_to_scan.push((node.path.clone(), layer));
-                if let Some(name) = path.name()
-                    && let Ok(child_in_node) = node.path.append_path(name)
-                {
-                    nodes_to_scan.push((child_in_node, layer));
-                }
-            }
-        }
-
-        let mut targets_to_cache = Vec::new();
-        for (scan_path, scan_layer) in &nodes_to_scan {
-            for field in [FieldKey::InheritPaths, FieldKey::Specializes] {
-                let Ok(val) = graph.layer(*scan_layer).data().get_field(scan_path, field.as_str()) else {
-                    continue;
-                };
-                let Value::PathListOp(list_op) = val.into_owned() else {
-                    continue;
-                };
-                for target in &list_op.flatten() {
-                    // Anchor a relative inherit/specialize target at the path it
-                    // is authored on (the scanned node's namespace), matching the
-                    // indexer's `path.make_absolute`. Anchoring at the
-                    // composed parent would mis-resolve `../` targets by a level.
-                    let raw = scan_path.make_absolute(target);
-                    // Try composed-namespace versions via ancestor arcs.
-                    for a in &ancestor_arcs {
-                        if let Some(composed) = a.map.map_source_to_target(&raw)
-                            && composed != raw
-                            && !targets_to_cache.contains(&composed)
-                        {
-                            targets_to_cache.push(composed);
-                        }
-                    }
-                    if !targets_to_cache.contains(&raw) {
-                        targets_to_cache.push(raw);
-                    }
-                }
-            }
-        }
-
-        for target in targets_to_cache {
-            self.precache_path(graph, &target);
-            // Recursively precache the target's own inherit targets.
-            if self.is_indexed(&target) {
-                self.precache_inherit_targets(graph, &target);
-            }
-        }
-    }
-
     // ------------------------------------------------------------------
     // Core composition
     // ------------------------------------------------------------------
@@ -3189,30 +3092,10 @@ impl IndexCache {
         if path.is_empty() || self.is_indexed(path) || self.in_unregistered_prototype(path) {
             return Ok(());
         }
-        // Composing a prim whose ancestor is still mid-build cannot seed from that
-        // ancestor's opinions. This happens only when pre-caching an
-        // inherit/specialize target that is a namespace descendant of an
-        // in-progress ancestor (a prim inheriting its own descendant). The
-        // descendant may be more than one level down (`/A` inheriting `/A/B/C`),
-        // so every strict ancestor is checked, not just the parent. Defer without
-        // caching an under-seeded result; a later query composes it correctly once
-        // the ancestor is cached, and the cycle-closing arc finds no cached target.
-        if path.strict_ancestors().any(|a| self.in_progress.contains(&a)) {
-            return Ok(());
-        }
-        // A re-entrant call for a path already mid-build is a class-hierarchy
-        // cycle reached through inherit/specialize pre-caching. Bail out: the
-        // outer build finishes, and the cycle-closing arc finds no cached target.
-        if !self.in_progress.insert(path.clone()) {
-            return Ok(());
-        }
-        let result = self.build_index(graph, path);
-        self.in_progress.remove(path);
-        result
+        self.build_index(graph, path)
     }
 
-    /// Builds and caches the index for `path`, assuming `path` is already
-    /// recorded in [`in_progress`](Self::in_progress) (see [`ensure_index`](Self::ensure_index)).
+    /// Builds and caches the index for `path` (see [`ensure_index`](Self::ensure_index)).
     fn build_index(&mut self, graph: &LayerGraph, path: &Path) -> Result<(), QueryError> {
         // An already-cached path must not rebuild through here: the builder's
         // cache-hit path reports empty expression-variable dependencies (the
@@ -3239,11 +3122,6 @@ impl IndexCache {
             self.precache_path(graph, &parent);
         }
 
-        // Pre-cache inherit/specialize targets so the indexer can
-        // find them. This handles the timing issue where a target prim is
-        // in a sibling subtree that hasn't been traversed yet.
-        self.precache_inherit_targets(graph, path);
-
         let parent_ctx = path
             .parent()
             .and_then(|p| self.store.context_at(&p))
@@ -3255,12 +3133,18 @@ impl IndexCache {
         // `LoadRules::effective_rule`'s lookahead).
         let load_payloads = self.is_loaded(path);
 
-        // TODO(rayon): `build_with_cache` is a pure function of `graph`,
-        // `&parent_ctx`, and the store's entries, so sibling prims compose
-        // independently and this is the natural per-prim `par_iter` boundary.
-        // The blocker is the shared store the inherit/specialize targets read
-        // mid-build — parallelizing the driver needs a concurrent map or a
-        // topological (targets-first) build order.
+        // TODO(rayon): a build reads `graph`, `&parent_ctx` and the parent's
+        // cached entry, and nothing else from the store. Every prim whose parent
+        // is cached therefore composes independently, as do the instance check,
+        // the child context and the property-type scan below, which read only
+        // the new index. The batch to fan out is a whole namespace level, cached
+        // in order afterwards through `&mut self`: one prim's children are too
+        // few to pay for waking the worker threads. Two things block it.
+        // `LayerGraph` is not `Sync`: `ar::Resolver` and `sdf::AbstractData`
+        // carry no `Send + Sync` bound, and each layer owns its sinks, which the
+        // stage's aggregator keeps single-threaded. And every prim still pays
+        // two serial steps on this thread: `IndexStore::insert` here, and the
+        // child-name composition a traversal asks for next.
         let (mut index, mut build_errors, pending_loads, mut expr_var_deps) =
             PrimIndex::build_with_cache(path, graph, &parent_ctx, self.store.entries(), load_payloads)?;
         self.pending_loads.extend(pending_loads);
@@ -3681,12 +3565,9 @@ def "Unrelated"
     }
 
     /// A prim inheriting its own grand-descendant (`/A` inherits `/A/B/C`) is a
-    /// cycle whose arc is dropped, but composing `/A` must not cache an
-    /// under-seeded `/A/B/C`. The inherit-target precache builds `/A/B/C` while
-    /// `/A` is in progress, and its parent `/A/B` is not the in-progress prim, so
-    /// the deferral guard must check every ancestor, not just the parent. `/A/B`
-    /// references `</Lib/Ref>`, so a correctly-seeded `/A/B/C` exposes the
-    /// reference's `mark` property.
+    /// cycle whose arc is dropped. `/A/B/C`, queried after `/A` composes, seeds
+    /// from its own ancestors. Through `/A/B`, which references `</Lib/Ref>`,
+    /// it exposes the reference's `mark` property.
     #[test]
     fn grandchild_inherit_target_seeds_ancestors() -> Result<()> {
         let text = r#"#usda 1.0
@@ -3707,15 +3588,13 @@ def "A" (
 }
 "#;
         let (graph, mut cache) = in_memory_stack(text);
-        // Compose /A first so its inherit-target precache runs before /A/B/C is
-        // queried; the precache must not leave a stale, parentless /A/B/C cached.
         cache.ensure_index(&graph, &sdf::path("/A")?)?;
         assert!(
             cache
                 .prim_properties(&graph, &sdf::path("/A/B/C")?)?
                 .iter()
                 .any(|t| t.as_str() == "mark"),
-            "/A/B/C must inherit the reference's `mark` via /A/B even when reached through /A's precache"
+            "/A/B/C must inherit the reference's `mark` via /A/B after /A composes"
         );
         Ok(())
     }

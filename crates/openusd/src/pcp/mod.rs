@@ -313,10 +313,11 @@
 //! # Remaining work
 //!
 //! - Cross-prim parallelism: `IndexCache::ensure_index` composes prims serially.
-//!   Each build is a pure function of `&LayerGraph`, the parent context, and the
-//!   cached indices (`TODO(rayon)`), but the shared `indices` map that
-//!   inherit/specialize targets read mid-build first needs a concurrent map or a
-//!   targets-first build order. [`PrimIndex`] is already `Send + Sync`.
+//!   Each build reads only `&LayerGraph`, the parent context and the parent's
+//!   cached index. The prims of a namespace level could therefore compose at
+//!   once (`TODO(rayon)`). Two things block it: `LayerGraph` is not `Sync`, and
+//!   the per-prim cache insert is serial. [`PrimIndex`] is already
+//!   `Send + Sync`.
 //! - Releasing a muted layer's memory: `LayerGraph` keeps a muted layer's node
 //!   interned so unmute is a rebuild; C++ drops its references. The node and its
 //!   backing data are retained for the life of the graph.

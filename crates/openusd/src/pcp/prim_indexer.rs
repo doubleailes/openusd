@@ -456,8 +456,9 @@ struct Site {
 /// grown node-by-node (C++ `Pcp_PrimIndexer`).
 ///
 /// All borrowed inputs are shared references, so each build is an independent
-/// pure function over the layer stack and incoming context (Rayon-friendly —
-/// see the `TODO(rayon)` on the cross-prim driver in `index_cache.rs`).
+/// pure function over the layer stack and incoming context (see the
+/// `TODO(rayon)` on the cross-prim driver in `index_cache.rs` for what running
+/// builds in parallel still needs).
 pub(crate) struct Indexer<'a, 'f> {
     /// Shared read-only inputs (layer stack, context, cached indices).
     inputs: Inputs<'a>,
