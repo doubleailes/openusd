@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::sdf;
 use crate::sdf::schema::FieldKey;
-use crate::sdf::{Path, PathElement, Value};
+use crate::sdf::{Path, Value};
 use crate::tf::Token;
 
 use super::diagnostics::Diagnostics;
@@ -28,10 +28,10 @@ use super::index_cache::IndexCache;
 use super::layer_graph::LayerGraph;
 use super::load_rules::LoadRules;
 use super::population_mask::PopulationMask;
-use super::prim_graph::ArcType;
+use super::prim_graph::{ArcType, NodeId};
 use super::prim_index::PrimIndex;
 use super::prim_indexer::ExprVarDeps;
-use super::{LayerId, QueryError};
+use super::{LayerStackId, QueryError};
 
 /// The shared-prototype registry (spec 11.3.3): maps each instancing key to its
 /// prototype and tracks the instances that share it. Owns no composition state
@@ -64,9 +64,9 @@ pub(super) struct PrototypeRegistry {
 /// A shared prototype for a set of instances with the same [`InstanceKey`]
 /// (spec 11.3.3). The prototype *root* is composed as an independent
 /// `/__Prototype_N` index, built from the canonical instance's shared subtree —
-/// the instanceable arc, its descendants, and the implied classes — with the
-/// instance-local opinions (the local root override and the ancestral references
-/// above the instanceable arc) inerted (see
+/// the arcs introduced at the instance and everything below them — with the
+/// instance-local opinions (the local root override and the ancestral arcs the
+/// instance is nested under) inerted (see
 /// [`PrimIndex::mark_instance_local_inert`]) and the namespace re-anchored onto
 /// the prototype root (see [`PrimIndex::rebase_root`]). Its descendants compose
 /// in place by deepening that graph, and every sharing instance's proxies
@@ -100,17 +100,13 @@ pub(super) struct Prototype {
     pub(super) relative_mask: PopulationMask,
 }
 
-/// Identity of an instance prim's shared composition (spec 11.3.3): the
-/// arc-introduced opinions that determine its subtree, independent of the
-/// instance's own stage path. Instances with equal keys share a prototype.
+/// Identity of an instance prim's shared composition (spec 11.3.3, C++
+/// `Usd_InstanceKey` over `PcpInstanceKey`): the arcs whose opinions determine
+/// its subtree, independent of the instance's own stage path. Instances with
+/// equal keys share a prototype. See `instance_key` for which arcs count.
 ///
-/// Variant selections are folded in explicitly via [`selections`](Self::selections)
-/// rather than left implicit in the arc paths: each arc's path has its variant
-/// selections stripped (so two instances of the same reference produce the same
-/// arc path regardless of which variant they pick) and the resolved selection
-/// set is carried as a separate, path-independent list. Without the explicit
-/// list, two instances of one reference that differ only by a variant selection
-/// would collide once the selection is stripped from the path.
+/// Each arc keeps its site path as composed, variant selections included, and
+/// the resolved selection set is carried as well, as C++ keys both.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(super) struct InstanceKey {
     arcs: Vec<InstanceArc>,
@@ -138,7 +134,7 @@ pub(super) struct InstanceKey {
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct InstanceArc {
     arc: u8,
-    layer: LayerId,
+    layer_stack: LayerStackId,
     path: String,
     layer_offset_bits: (u64, u64),
 }
@@ -231,6 +227,13 @@ impl PrototypeRegistry {
         self.by_root.contains_key(path)
     }
 
+    /// Whether `path` is a registered instance, by composed path, or a
+    /// `/__Prototype_N` root: the two paths whose index a prototype's key was
+    /// computed from or materialized into.
+    pub(super) fn is_registered(&self, path: &Path) -> bool {
+        self.by_instance.contains_key(path) || self.by_root.contains_key(path)
+    }
+
     /// Returns the nearest registered `/__Prototype_N` root at or above `path`,
     /// inclusive of `path` itself, or `None` when it is outside every
     /// registered prototype namespace.
@@ -316,44 +319,56 @@ pub(crate) fn is_prototype_namespace(path: &Path) -> bool {
             .is_some_and(|name| name.starts_with(PROTOTYPE_PREFIX))
 }
 
-/// Computes the instancing key for an already-built instance index: the
-/// arc-introduced (shared) opinions that define the prototype subtree,
+/// Computes the instancing key for an already-built instance index (C++
+/// `PcpInstanceKey`): the arcs whose opinions define the prototype subtree,
 /// independent of the instance's own stage path (spec 11.3.3).
 /// `instance_depth` is the instance prim's own namespace depth, used to
 /// partition shared from instance-local nodes
 /// ([`PrimIndex::instance_local_nodes`]).
 ///
-/// Each contributing arc's path is stripped of variant selections, and the
-/// resolved selection set is folded into the key explicitly (see
-/// [`InstanceKey`]), so two instances of one reference share a prototype iff
-/// their variant selections also match. `load_rules` and `mask` are the
-/// instance's load rules and population mask, already re-rooted onto its own
-/// path (`LoadRules::make_relative_to`, `PopulationMask::make_relative_to`), so
-/// two instances also only share a prototype when their load state and their
-/// exposure agree.
+/// The nodes are walked strong to weak, skipping culled subtrees, and a node
+/// joins the key when it is instanceable
+/// ([`PrimIndex::instanceable_nodes`]). A node without specs adds nothing to the
+/// prototype, so two instances whose implied arcs differ only in such nodes —
+/// an ancestor's class implied down to each instance's own path, say — still
+/// share. Below an instanceable node the walk stops unless the index holds a
+/// payload arc anywhere (C++ `PcpPrimIndex::HasAnyPayloads`), whose inclusion
+/// can differ between instances: the node's site already determines what lies
+/// under it.
+///
+/// Each arc keeps its site path as composed, variant selections included, and
+/// the resolved selection set is folded in as well (see [`InstanceKey`]).
+/// `load_rules` and `mask` are the instance's load rules and population mask,
+/// already re-rooted onto its own path (`LoadRules::make_relative_to`,
+/// `PopulationMask::make_relative_to`), so two instances also only share a
+/// prototype when their load state and their exposure agree.
 fn instance_key(index: &PrimIndex, instance_depth: u16, load_rules: LoadRules, mask: PopulationMask) -> InstanceKey {
-    let local = index.instance_local_nodes(instance_depth, instance_depth);
+    let instanceable = index.instanceable_nodes(instance_depth);
+    let has_payload = index.arena().iter().any(|node| node.arc == ArcType::Payload);
     let mut arcs = Vec::new();
-    let mut selections = Vec::new();
-    for (id, node) in index.nodes_with_ids() {
-        if local[id.idx()] || node.is_culled() {
+    let mut stack: Vec<NodeId> = index.root().into_iter().collect();
+    while let Some(id) = stack.pop() {
+        let node = index.node(id);
+        if node.is_culled() {
             continue;
         }
-        if node.arc == ArcType::Variant
-            && let Some(PathElement::Variant { set, selection }) = node.path.last_element()
-        {
-            selections.push((set.to_string(), selection.to_string()));
+        if instanceable[id.idx()] {
+            arcs.push(InstanceArc {
+                arc: node.arc as u8,
+                layer_stack: node.layer_stack_id(),
+                path: node.path.to_string(),
+                layer_offset_bits: node.map_to_root.time_offset().to_bits(),
+            });
+            if !has_payload {
+                continue;
+            }
         }
-        arcs.push(InstanceArc {
-            arc: node.arc as u8,
-            layer: node.layer_id(),
-            path: node.path.strip_all_variant_selections().to_string(),
-            layer_offset_bits: node.map_to_root.time_offset().to_bits(),
-        });
+        // Children in reverse, so the stack pops them strongest first.
+        stack.extend(node.children.iter().rev());
     }
     InstanceKey {
         arcs,
-        selections,
+        selections: index.variant_selections(),
         load_rules,
         mask,
     }
@@ -403,12 +418,10 @@ impl IndexCache {
     /// gate, which decides both whether to descend past a prim and whether its
     /// index may register as an instance.
     ///
-    /// This is eligibility for population traversal and instance registration,
-    /// **not** prim existence: an inactive prim still exists and still composes,
-    /// and C++ instantiates it too — what it suppresses is that prim's
-    /// descendants and its instance registration. So the only two callers are
-    /// [`Self::is_instance`] and the stage's discovery walk; it must never gate
-    /// [`Self::has_spec`], `Prim::is_valid`, or any ordinary read.
+    /// This is eligibility for descent and instance registration, **not** prim
+    /// existence: an inactive prim still exists and still composes, and C++
+    /// instantiates it too — what it suppresses is that prim's descendants and
+    /// its instance registration, and never the prim's own reads.
     ///
     /// The steps are ordered so nothing below an excluded or inactive ancestor
     /// is ever composed or loaded: the mask test is pure, the parent is settled
@@ -434,12 +447,10 @@ impl IndexCache {
             return Ok(*hit);
         }
         let pending_before = self.pending_loads.len();
-        let parent = path.parent().expect("a non-root path has a parent");
-        // Short-circuiting is what orders the steps: the mask test composes
-        // nothing, and neither the prim nor its own `active` is reached until
-        // its parent is settled. The redirect is resolved once and both reads
-        // take it, rather than each finding it again.
-        let populated = self.mask_includes(path) && self.is_populated(graph, &parent)? && {
+        // Short-circuiting is what orders the steps: neither the prim nor its
+        // own `active` is reached until the population is known to reach it.
+        // The redirect is resolved once and both reads take it.
+        let populated = self.population_reaches(graph, path)? && {
             let composed = self.effective_path(graph, path)?;
             self.has_spec_at(graph, &composed)? && self.active_at(graph, &composed)?
         };
@@ -447,6 +458,62 @@ impl IndexCache {
             self.populated_prims.insert(path.clone(), populated);
         }
         Ok(populated)
+    }
+
+    /// Whether the stage's population reaches `path`: the mask exposes it and
+    /// its parent is populated. A prim that composes there is on the stage
+    /// whatever its own `active` says, as C++ `UsdStage::_ComposeChildren`
+    /// composes every child of a populated prim. Nothing at `path` itself is
+    /// composed to answer.
+    pub(crate) fn population_reaches(&mut self, graph: &LayerGraph, path: &Path) -> Result<bool, QueryError> {
+        if !self.mask_includes(path) {
+            return Ok(false);
+        }
+        // TODO(perf): every gated stage read lands here, and building the
+        // parent path allocates before the memo is probed. A borrowed parent
+        // accessor on `Path`, with the memo keyed to accept it, would make a
+        // memo hit allocation-free.
+        match path.parent() {
+            Some(parent) => self.is_populated(graph, &parent),
+            // The pseudo-root, which nothing can deactivate.
+            None => Ok(true),
+        }
+    }
+
+    /// Whether the stage's population excludes `path`: the mask hides it, or
+    /// an ancestor that composes is inactive. A path below an ancestor nothing
+    /// composes — one inside a variant the stage has not selected — is not
+    /// excluded, since no opinion on the stage keeps a prim from standing
+    /// there.
+    ///
+    /// The ancestors are settled from the root down, so nothing below an
+    /// inactive one is composed to answer.
+    pub(crate) fn population_excludes(&mut self, graph: &LayerGraph, path: &Path) -> Result<bool, QueryError> {
+        if !self.mask_includes(path) {
+            return Ok(true);
+        }
+        let mut ancestors: Vec<Path> = path.strict_ancestors_below_root().collect();
+        ancestors.reverse();
+        for ancestor in &ancestors {
+            if !self.is_populated(graph, ancestor)? {
+                // Its own ancestors are populated, so it is either inactive,
+                // which excludes everything below it, or composes nothing.
+                return self.has_spec(graph, ancestor);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The names of the child prims the stage holds below `path`, in
+    /// strongest-layer order: the composed names the population mask exposes,
+    /// and none below a prim that is not populated (C++
+    /// `UsdStage::_ComposeChildren`, which discards the descendants of an
+    /// inactive prim).
+    pub(crate) fn populated_children(&mut self, graph: &LayerGraph, path: &Path) -> Result<Vec<Token>, QueryError> {
+        if !self.is_populated(graph, path)? {
+            return Ok(Vec::new());
+        }
+        self.prim_children(graph, path)
     }
 
     /// Whether an answer just computed for `path` may change with no edit to
@@ -472,7 +539,10 @@ impl IndexCache {
 
     /// Returns `true` if `path` resolves as an instance prim (spec 11.3.3):
     /// the strongest `instanceable` opinion is `true` and the prim has at
-    /// least one composition arc.
+    /// least one instanceable node ([`PrimIndex::has_instanceable_node`]), as
+    /// C++ `Pcp_PrimIndexIsInstanceable` requires. An arc inherited from an
+    /// ancestor does not count: its opinions are the instance's own, so a prim
+    /// with no other arc keeps its local children.
     ///
     /// A `/__Prototype_N` root is never an instance, whatever its composed
     /// `instanceable` opinion says. The opinion is routinely `true` there: an
@@ -509,7 +579,7 @@ impl IndexCache {
         let composed = self.effective_path(graph, path)?;
         self.ensure_index(graph, &composed)?;
         let index = self.cached(&composed);
-        if !index.has_composition_arc() {
+        if !index.has_instanceable_node(composed.prim_element_count() as u16) {
             return Ok(false);
         }
         Ok(matches!(
@@ -568,10 +638,10 @@ impl IndexCache {
     /// Builds and caches the composed index for a freshly minted prototype root
     /// (`/__Prototype_N`) from the canonical instance's shared subtree (spec
     /// 11.3.3). The clone of the canonical index has its instance-local nodes
-    /// inerted at the instance root's own depth, so only the instanceable arc,
-    /// its descendants, and the implied classes contribute — the local root
-    /// override and the ancestral references above the instanceable arc drop out
-    /// — and its namespace is re-anchored onto the prototype root.
+    /// inerted at the instance root's own depth, so only the arcs introduced at
+    /// the instance and their subtrees contribute — the local root override and
+    /// the ancestral arcs the instance is nested under drop out — and its
+    /// namespace is re-anchored onto the prototype root.
     ///
     /// The prototype root's child context is seeded as a namespace root with
     /// `instance_depth` cleared — a prototype root is not an instance (see

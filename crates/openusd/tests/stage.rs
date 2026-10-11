@@ -3,11 +3,13 @@
 //! resolution, prim/attribute/relationship handles, instancing, value
 //! clips, and stage-tier authoring.
 
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path as FsPath;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use openusd::Result;
 use openusd::ar::Resolver as _;
@@ -16,7 +18,7 @@ use openusd::usd::{
     StageAuthoringError, StagePopulationMask, StageSink,
 };
 use openusd::usdz::ArchiveWriter;
-use openusd::{ar, gf, pcp, sdf, tf, usd};
+use openusd::{ar, gf, kind, pcp, sdf, tf, usd};
 
 /// A [`StageSink`] for tests: holds optional closures for the composed-change and
 /// lifecycle hooks a test cares about, recording into shared state it inspects
@@ -97,6 +99,13 @@ fn fixture_path(relative: &str) -> String {
 // through the handle that now owns the query so the assertions stay terse.
 fn child_names(stage: &Stage, path: impl sdf::IntoPath) -> Result<Vec<String>> {
     Ok(stage.prim(path)?.child_names()?.into_iter().map(String::from).collect())
+}
+
+/// Writes `text` as the root layer of a stage in `dir` and opens it.
+fn open_text(dir: &tempfile::TempDir, text: &str) -> Result<Stage> {
+    let root = dir.path().join("root.usda");
+    fs::write(&root, text)?;
+    Stage::open(root.to_str().unwrap())
 }
 
 fn prop_names(stage: &Stage, path: impl sdf::IntoPath) -> Result<Vec<String>> {
@@ -3062,8 +3071,9 @@ def "Inst" (
 #[test]
 fn forwarded_targets_honor_mask() -> Result<()> {
     // Forwarding must not read a relationship on a masked-out prim, so the
-    // chain through /Hidden.rel contributes nothing; a direct prim target
-    // to the masked prim is still returned (raw target value, not a query).
+    // chain stops at /Hidden.rel, which is returned as authored (C++ follows
+    // a relationship only through a valid prim); a direct prim target to the
+    // masked prim is returned too (raw target value, not a query).
     let dir = tempfile::tempdir()?;
     let root = dir.path().join("root.usda");
     fs::write(
@@ -3089,7 +3099,10 @@ def "Hidden"
         .open(root.to_str().expect("utf-8 temp path"))?;
 
     // /Hidden is masked out: its relationship is not followed.
-    assert!(fwd_targets(&stage, &sdf::Path::new("/Vis.chain")?)?.is_empty());
+    assert_eq!(
+        fwd_targets(&stage, &sdf::Path::new("/Vis.chain")?)?,
+        paths(&["/Hidden.rel"])
+    );
     // A direct prim target is still returned, matching raw targets.
     assert_eq!(
         fwd_targets(&stage, &sdf::Path::new("/Vis.direct")?)?,
@@ -3222,6 +3235,12 @@ impl ar::Resolver for RecordingResolver {
     }
     fn identity(&self) -> String {
         self.inner.identity()
+    }
+    fn is_context_dependent_path(&self, asset_path: &str) -> bool {
+        self.inner.is_context_dependent_path(asset_path)
+    }
+    fn in_memory_identifier<'a>(&self, asset_path: &'a str) -> Cow<'a, str> {
+        self.inner.in_memory_identifier(asset_path)
     }
 }
 
@@ -3807,6 +3826,96 @@ fn shared_instances_resolve_identically() -> Result<()> {
     Ok(())
 }
 
+/// Class arcs that add no shared opinions do not split instances, as in C++
+/// `PcpInstanceKey`: `/Set`'s class implied down to `/Set/A` and `/Set/B` is
+/// ancestral, so even its opinion on `A/Geo` neither keys nor reaches the
+/// instance, and `/C` and `/D` inherit classes nothing defines. All four share
+/// one prototype and resolve `Geo.radius` to the referenced asset's value.
+#[test]
+fn class_arcs_share_prototype() -> Result<()> {
+    let stage = Stage::open(&fixture_path("instancing_class_arcs.usda"))?;
+
+    let prototype = first_prototype(&stage)?;
+    for instance in ["/Set/A", "/Set/B", "/C", "/D"] {
+        assert_eq!(
+            stage.prim(instance)?.prototype()?.as_ref(),
+            Some(&prototype),
+            "{instance}"
+        );
+        assert_eq!(
+            stage
+                .attribute(format!("{instance}/Geo.radius"))?
+                .get_at::<sdf::Value>(usd::TimeCode::new(0.0))?,
+            Some(sdf::Value::Double(1.0)),
+            "{instance}"
+        );
+    }
+    assert_eq!(stage.prototypes()?, vec![prototype]);
+    Ok(())
+}
+
+/// Reads `Geo.radius` under `instance` at the default time.
+fn geo_radius(stage: &Stage, instance: &str) -> Result<Option<sdf::Value>> {
+    stage
+        .attribute(format!("{instance}/Geo.radius"))?
+        .get_at::<sdf::Value>(usd::TimeCode::new(0.0))
+}
+
+/// A class that gains its first spec joins the key of the instance inheriting
+/// it (C++ `Pcp_ChildNodeInstanceableChanged`): `/C` leaves the prototype it
+/// shared, and the opinion reaches `/C` alone, even though `/C` seeded that
+/// prototype. Removing the class again brings `/C` back.
+#[test]
+fn class_spec_rekeys_instance() -> Result<()> {
+    let stage = Stage::open(&fixture_path("instancing_class_arcs.usda"))?;
+    // `/C` registers first, so the shared prototype is seeded from its index.
+    let shared = stage.prim("/C")?.prototype()?.expect("an instance");
+    assert_eq!(stage.prim("/D")?.prototype()?.as_ref(), Some(&shared));
+
+    stage
+        .override_prim("/__class__/C/Geo")?
+        .create_attribute("radius", "double")?
+        .set(sdf::Value::Double(7.0))?;
+
+    let own = stage.prim("/C")?.prototype()?.expect("an instance");
+    assert_eq!(geo_radius(&stage, "/C")?, Some(sdf::Value::Double(7.0)));
+    for instance in ["/D", "/Set/A", "/Set/B"] {
+        let prototype = stage.prim(instance)?.prototype()?.expect("an instance");
+        assert_ne!(prototype, own, "{instance}");
+        assert_eq!(
+            geo_radius(&stage, instance)?,
+            Some(sdf::Value::Double(1.0)),
+            "{instance}"
+        );
+    }
+    assert_eq!(stage.prim(own.clone())?.instances()?, paths(&["/C"]));
+    assert_eq!(stage.prototypes()?.len(), 2);
+
+    assert!(stage.remove_prim("/__class__/C")?);
+    let prototype = stage.prim("/D")?.prototype()?.expect("an instance");
+    assert_eq!(stage.prim("/C")?.prototype()?.as_ref(), Some(&prototype));
+    assert_eq!(geo_radius(&stage, "/C")?, Some(sdf::Value::Double(1.0)));
+    assert_eq!(stage.prototypes()?, vec![prototype]);
+    Ok(())
+}
+
+/// An `instanceable` prim whose only arc is its ancestor's is not an instance,
+/// as in C++ `Pcp_PrimIndexIsInstanceable`: the inherited class's opinions are
+/// the prim's own, so its children stay.
+#[test]
+fn ancestral_arc_not_instance() -> Result<()> {
+    let stage = Stage::open(&fixture_path("instancing_ancestral_arc.usda"))?;
+
+    let prim = stage.prim("/Set/A")?;
+    assert!(!prim.is_instance()?);
+    assert_eq!(prim.prototype()?, None);
+    assert!(stage.prim("/Set/A/Geo")?.is_valid()?);
+    assert!(stage.prim("/Set/A/Local")?.is_valid()?);
+    assert_eq!(geo_radius(&stage, "/Set/A")?, Some(sdf::Value::Double(5.0)));
+    assert!(stage.prototypes()?.is_empty());
+    Ok(())
+}
+
 /// `get_prototype` / `get_instances` group instances by shared composition,
 /// and the prototype namespace is addressable (spec 11.3.3).
 #[test]
@@ -4193,6 +4302,379 @@ def \"Off\" (
         "the payload under an inactive prim was never demanded: {:?}",
         stage.composition_errors()
     );
+    Ok(())
+}
+
+const INACTIVE_PARENT: &str = "#usda 1.0
+def Xform \"P\" (
+    active = false
+)
+{
+    custom double x = 1
+    def Sphere \"C\"
+    {
+        custom double y = 2
+        def Scope \"D\" {}
+    }
+}
+";
+
+/// An inactive prim stays on the stage and answers its own reads, while its
+/// descendants are off it: no child list or traversal names them and no handle
+/// to one is valid (C++ `UsdStage::_ComposeChildren`). Their prim indices
+/// still compose, the composition tier being outside the stage's population.
+#[test]
+fn inactive_prim_no_descendants() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = open_text(&dir, INACTIVE_PARENT)?;
+
+    let p = stage.prim("/P")?;
+    assert!(p.is_valid()?);
+    assert!(!p.is_active()?);
+    assert_eq!(stage.attribute("/P.x")?.get::<f64>()?, Some(1.0));
+    assert!(p.child_names()?.is_empty());
+    assert!(p.children()?.is_empty());
+
+    for below in ["/P/C", "/P/C/D"] {
+        let prim = stage.prim(below)?;
+        assert!(!prim.is_valid()?, "{below}");
+        assert!(prim.child_names()?.is_empty(), "{below}");
+        assert!(prim.prim_stack()?.is_empty(), "{below}");
+        assert_eq!(stage.prim_status(below)?, PrimStatus::empty(), "{below}");
+    }
+    assert_eq!(stage.attribute("/P/C.y")?.get::<f64>()?, None);
+
+    let mut visited = Vec::new();
+    stage.traverse(PrimPredicate::ALL, |path| visited.push(path.clone()))?;
+    assert_eq!(visited, paths(&["/P"]));
+
+    let (children, _) = stage.prim_index("/P")?.child_names()?;
+    assert_eq!(children, vec![tf::Token::new("C")]);
+    assert_eq!(stage.prim_index("/P/C")?.prim_stack()?.len(), 1);
+    Ok(())
+}
+
+/// A direct read below an inactive prim composes nothing there and never
+/// demands the payload authored below it. The same payload under an active
+/// parent reports its missing target.
+#[test]
+fn inactive_subtree_never_loads() -> Result<()> {
+    let scene = |active: bool| {
+        format!(
+            "#usda 1.0
+def \"Parent\" (
+    active = {active}
+)
+{{
+    def \"Deep\" (
+        payload = @missing.usda@
+    ) {{
+        def \"Leaf\" {{}}
+    }}
+}}
+"
+        )
+    };
+
+    let dir = tempfile::tempdir()?;
+    let stage = open_text(&dir, &scene(false))?;
+    assert!(!stage.prim("/Parent/Deep/Leaf")?.is_valid()?);
+    assert!(child_names(&stage, "/Parent/Deep")?.is_empty());
+    assert!(
+        stage.composition_errors().is_empty(),
+        "the payload under an inactive prim was never demanded: {:?}",
+        stage.composition_errors()
+    );
+
+    let dir = tempfile::tempdir()?;
+    let stage = open_text(&dir, &scene(true))?;
+    assert!(stage.prim("/Parent/Deep/Leaf")?.is_valid()?);
+    assert!(
+        !stage.composition_errors().is_empty(),
+        "the same payload under an active prim is demanded"
+    );
+    Ok(())
+}
+
+/// Forwarding keeps a target on a relationship below an inactive prim as it
+/// is authored, without composing the prim that owns it (C++
+/// `UsdRelationship::GetForwardedTargets`, which follows a relationship only
+/// through a valid prim).
+#[test]
+fn forwarding_stops_at_inactive() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = open_text(
+        &dir,
+        "#usda 1.0
+def \"A\" {
+    rel r = </Off/Deep.r>
+}
+def \"X\" {}
+def \"Off\" (
+    active = false
+)
+{
+    def \"Deep\" (
+        payload = @missing.usda@
+    ) {
+        rel r = </X>
+    }
+}
+",
+    )?;
+
+    assert_eq!(fwd_targets(&stage, &sdf::path("/A.r")?)?, paths(&["/Off/Deep.r"]));
+    assert!(rel_targets(&stage, &sdf::path("/Off/Deep.r")?)?.is_empty());
+    assert!(
+        stage.composition_errors().is_empty(),
+        "the payload under an inactive prim was never demanded: {:?}",
+        stage.composition_errors()
+    );
+    Ok(())
+}
+
+/// Deactivating a prim takes its descendants off the stage and reactivating
+/// it brings them back, with the answers cached in between retired.
+#[test]
+fn activation_toggles_descendants() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = open_text(
+        &dir,
+        "#usda 1.0\ndef \"P\" {\n    def \"C\" {\n        def \"D\" {}\n    }\n}\n",
+    )?;
+
+    let on_stage = |stage: &Stage| -> Result<(Vec<String>, bool, bool)> {
+        Ok((
+            child_names(stage, "/P")?,
+            stage.prim("/P/C")?.is_valid()?,
+            stage.prim("/P/C/D")?.is_valid()?,
+        ))
+    };
+    assert_eq!(on_stage(&stage)?, (vec!["C".to_string()], true, true));
+
+    stage.prim("/P")?.set_active(false)?;
+    assert_eq!(on_stage(&stage)?, (Vec::new(), false, false));
+    assert!(stage.prim("/P")?.is_valid()?);
+
+    stage.prim("/P")?.set_active(true)?;
+    assert_eq!(on_stage(&stage)?, (vec!["C".to_string()], true, true));
+    Ok(())
+}
+
+/// Defining a prim below an inactive one authors its spec, but the stage does
+/// not hold the prim: the returned handle is invalid and takes no write until
+/// the parent is reactivated (C++ `UsdStage::DefinePrim`).
+#[test]
+fn define_below_inactive() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = open_text(&dir, INACTIVE_PARENT)?;
+
+    let new = stage.define_prim("/P/New")?;
+    assert!(!new.is_valid()?);
+    assert_eq!(
+        stage.prim_index("/P/New")?.prim_stack()?.len(),
+        1,
+        "the spec is authored"
+    );
+    assert!(matches!(
+        new.clone().set_kind("component"),
+        Err(StageAuthoringError::PrimNotValid { .. })
+    ));
+
+    stage.prim("/P")?.set_active(true)?;
+    assert!(new.is_valid()?);
+    assert_eq!(child_names(&stage, "/P")?, ["C", "New"]);
+    new.set_kind("component")?;
+    Ok(())
+}
+
+/// A property write needs a prim the stage holds: below an inactive prim every
+/// creation and every write to an existing property is refused and authors
+/// nothing (C++ authoring through an invalid `UsdPrim`). After reactivation
+/// the write stamps the declaration the weaker layer gives the property.
+#[test]
+fn property_write_below_inactive() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("weak.usda"),
+        "#usda 1.0
+def \"P\" {
+    def \"C\" {
+        double radius = 1
+        rel proxy
+    }
+}
+",
+    )?;
+    let stage = open_text(
+        &dir,
+        "#usda 1.0
+(
+    subLayers = [@weak.usda@]
+)
+over \"P\" (
+    active = false
+) {}
+",
+    )?;
+
+    let not_valid = |result: Result<(), StageAuthoringError>| {
+        assert!(
+            matches!(result, Err(StageAuthoringError::PrimNotValid { .. })),
+            "{result:?}"
+        );
+    };
+    not_valid(stage.create_attribute("/P/C.radius", "float").map(drop));
+    not_valid(stage.create_attribute("/P/C.fresh", "float").map(drop));
+    not_valid(stage.create_relationship("/P/C.radius").map(drop));
+    not_valid(stage.create_relationship("/P/C.proxy").map(drop));
+    not_valid(stage.attribute("/P/C.radius")?.set(2.0).map(drop));
+    not_valid(stage.attribute("/P/C.radius")?.clear().map(drop));
+    not_valid(stage.relationship("/P/C.proxy")?.set_targets(["/P"]).map(drop));
+    not_valid(stage.relationship("/P/C.proxy")?.clear_targets().map(drop));
+    assert!(
+        stage.root_layer().prim("/P/C")?.is_none(),
+        "a refused write authors nothing"
+    );
+
+    stage.prim("/P")?.set_active(true)?;
+    let radius = stage.create_attribute("/P/C.radius", "float")?.set(2.0)?;
+    assert_eq!(radius.get::<f64>()?, Some(2.0), "stamped as the weaker layer's double");
+    assert!(matches!(
+        stage.create_relationship("/P/C.radius"),
+        Err(StageAuthoringError::SpecKindMismatch { .. })
+    ));
+    stage.relationship("/P/C.proxy")?.set_targets(["/P"])?;
+    assert_eq!(rel_targets(&stage, &sdf::path("/P/C.proxy")?)?, paths(&["/P"]));
+    Ok(())
+}
+
+/// A property write is refused on a prim the population mask excludes, as it
+/// is below an inactive prim.
+#[test]
+fn property_write_masked_out() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        "#usda 1.0\ndef \"Vis\" {}\ndef \"Hidden\" {\n    double x = 1\n}\n",
+    )?;
+    let stage = Stage::builder()
+        .mask(StagePopulationMask::new(["/Vis"])?)
+        .open(root.to_str().unwrap())?;
+
+    assert!(matches!(
+        stage.create_attribute("/Hidden.x", "double"),
+        Err(StageAuthoringError::PrimNotValid { .. })
+    ));
+    assert!(matches!(
+        stage.attribute("/Hidden.x")?.set(2.0),
+        Err(StageAuthoringError::PrimNotValid { .. })
+    ));
+    stage.create_attribute("/Vis.x", "double")?.set(2.0)?;
+    Ok(())
+}
+
+/// A prim that exists only inside a variant the stage has not selected takes
+/// property writes through an edit target on that variant, at any depth: the
+/// population does not exclude it though nothing composes there.
+#[test]
+fn property_write_unselected_variant() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage.define_prim("/World")?;
+    let root = stage.edit_target().layer_identifier().to_string();
+    stage.set_edit_target(EditTarget::for_local_direct_variant(root, "/World{set=sel}")?)?;
+
+    let only = stage.define_prim("/World/Only")?;
+    assert!(!only.is_valid()?, "the variant is not selected");
+    stage.create_attribute("/World/Only.x", "double")?;
+    stage.create_relationship("/World/Only.r")?.set_targets(["/World"])?;
+
+    stage.define_prim("/World/Only/Child")?;
+    stage.create_attribute("/World/Only/Child.x", "double")?;
+    stage
+        .create_relationship("/World/Only/Child.r")?
+        .set_targets(["/World"])?;
+
+    let layer = stage.root_layer();
+    assert!(layer.attribute("/World{set=sel}Only.x")?.is_some());
+    assert!(layer.relationship("/World{set=sel}Only.r")?.is_some());
+    assert!(layer.attribute("/World{set=sel}Only/Child.x")?.is_some());
+    assert!(layer.relationship("/World{set=sel}Only/Child.r")?.is_some());
+    Ok(())
+}
+
+/// A move onto a path below an inactive prim sees the stage, where nothing
+/// occupies the destination, though a reference composes a prim there. The
+/// move is authored, and reactivating the parent composes the moved spec over
+/// the referenced prim.
+#[test]
+fn move_below_inactive_reference() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("ref.usda"),
+        "#usda 1.0\ndef \"M\" {\n    def \"C\" {\n        double fromRef = 1\n    }\n}\n",
+    )?;
+    let stage = open_text(
+        &dir,
+        "#usda 1.0
+def \"A\" {
+    double local = 2
+}
+def \"P\" (
+    active = false
+    references = @ref.usda@</M>
+) {}
+",
+    )?;
+    assert_eq!(
+        stage.prim_index("/P/C")?.prim_stack()?.len(),
+        1,
+        "the reference composes /P/C"
+    );
+
+    let mut editor = usd::NamespaceEditor::new(&stage);
+    editor.move_prim("/A", "/P/C").unwrap();
+    editor.apply()?;
+    assert!(!stage.prim("/A")?.is_valid()?);
+    assert!(!stage.prim("/P/C")?.is_valid()?, "/P is still inactive");
+
+    stage.prim("/P")?.set_active(true)?;
+    assert_eq!(stage.attribute("/P/C.local")?.get::<f64>()?, Some(2.0));
+    assert_eq!(stage.attribute("/P/C.fromRef")?.get::<f64>()?, Some(1.0));
+    Ok(())
+}
+
+/// An ancestor whose `active` is not a bool cannot say whether its descendants
+/// are on the stage, so reads below it fail. Repairing the field restores
+/// them, with no failure left cached.
+#[test]
+fn malformed_active_fails_reads() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = open_text(
+        &dir,
+        "#usda 1.0\ndef \"P\" {\n    def \"C\" {\n        double y = 2\n    }\n}\n",
+    )?;
+    let root = stage.root_layer().identifier().to_string();
+    let set_active = |value: sdf::Value| -> Result<()> {
+        stage.layer_mut(&root).expect("root layer").edit(|e| {
+            e.data_mut()
+                .set_field(&sdf::path("/P")?, sdf::FieldKey::Active.as_str(), value);
+            Ok(())
+        })?;
+        Ok(())
+    };
+    assert_eq!(stage.attribute("/P/C.y")?.get::<f64>()?, Some(2.0));
+
+    set_active(sdf::Value::Int(5))?;
+    assert!(stage.prim("/P/C")?.is_valid().is_err());
+    assert!(stage.attribute("/P/C.y")?.get::<f64>().is_err());
+    assert!(stage.prim("/P")?.child_names().is_err());
+
+    set_active(sdf::Value::Bool(true))?;
+    assert!(stage.prim("/P/C")?.is_valid()?);
+    assert_eq!(stage.attribute("/P/C.y")?.get::<f64>()?, Some(2.0));
+    assert_eq!(child_names(&stage, "/P")?, ["C"]);
     Ok(())
 }
 
@@ -5232,8 +5714,92 @@ def Scope "A" (
     let child = stage.prim(proto.append_path("Child")?)?;
     assert!(child.is_model()?);
     assert!(child.is_component()?);
-    // In the instance's own namespace the chain of models breaks at /A.
-    assert!(!stage.prim("/A/Child")?.is_model()?);
+    // The proxy answers as that prim does, though the instance above it
+    // authors no kind and is no model itself.
+    let proxy = stage.prim("/A/Child")?;
+    assert!(proxy.is_instance_proxy()?);
+    assert!(proxy.is_model()? && proxy.is_component()?);
+    assert_eq!(model_flags(&stage, "/A")?, NOT_MODEL);
+    Ok(())
+}
+
+/// A proxy under a nested instance answers as the prim in the nested
+/// prototype, whose root is a group, whatever the instances above it author.
+/// `ModelAPI::is_kind` and the `model` status bit follow.
+#[test]
+fn proxy_model_from_prototype() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        r#"#usda 1.0
+def Scope "Inner"
+{
+    def Scope "Leaf" (
+        kind = "prop"
+    )
+    {
+        def Scope "Part" (
+            kind = "prop"
+        )
+        {
+        }
+    }
+}
+
+def Scope "Source"
+{
+    def Scope "Squad" (
+        kind = "chargroup"
+    )
+    {
+    }
+
+    def Scope "Nest" (
+        instanceable = true
+        references = </Inner>
+    )
+    {
+    }
+}
+
+def Scope "A" (
+    instanceable = true
+    kind = "site_root"
+    references = </Source>
+)
+{
+}
+"#,
+    )?;
+    let stage = Stage::builder()
+        .schema_registry(custom_kinds_registry()?)
+        .open(root.to_str().expect("utf-8 temp path"))?;
+
+    // The instance is classified as any prim is: by its own kind and place.
+    assert_eq!(model_flags(&stage, "/A")?, NOT_MODEL);
+    // Its proxies are classified in the prototype, under a root that is a
+    // group.
+    assert_eq!(model_flags(&stage, "/A/Squad")?, GROUP);
+    // The nested instance authors no kind, so it is no model, and its own
+    // proxies answer from the nested prototype.
+    assert!(stage.prim("/A/Nest")?.is_instance_proxy()?);
+    assert_eq!(model_flags(&stage, "/A/Nest")?, NOT_MODEL);
+    assert_eq!(model_flags(&stage, "/A/Nest/Leaf")?, COMPONENT);
+    // A component holds no model, in a prototype as anywhere.
+    assert_eq!(model_flags(&stage, "/A/Nest/Leaf/Part")?, NOT_MODEL);
+    // The source the instances reference is ordinary namespace.
+    assert_eq!(model_flags(&stage, "/Inner/Leaf")?, NOT_MODEL);
+
+    let leaf = usd::ModelAPI::from_prim_unchecked(stage.prim("/A/Nest/Leaf")?);
+    assert!(leaf.is_kind("component", usd::KindValidation::ModelHierarchy)?);
+    assert!(leaf.is_kind("prop", usd::KindValidation::ModelHierarchy)?);
+    let part = usd::ModelAPI::from_prim_unchecked(stage.prim("/A/Nest/Leaf/Part")?);
+    assert!(!part.is_kind("prop", usd::KindValidation::ModelHierarchy)?);
+    assert!(part.is_kind("prop", usd::KindValidation::None)?);
+
+    assert!(stage.prim_status("/A/Nest/Leaf")?.contains(PrimStatus::MODEL));
+    assert!(!stage.prim_status("/A/Nest")?.contains(PrimStatus::MODEL));
     Ok(())
 }
 
@@ -5618,6 +6184,153 @@ fn model_hierarchy() -> Result<()> {
     Ok(())
 }
 
+/// The three model-hierarchy answers for the prim at `path`.
+fn model_flags(stage: &Stage, path: &str) -> Result<(bool, bool, bool)> {
+    let prim = stage.prim(path)?;
+    Ok((prim.is_model()?, prim.is_group()?, prim.is_component()?))
+}
+
+/// A registry declaring the kinds `fixtures/custom_kinds.usda` authors.
+fn custom_kinds_registry() -> Result<Arc<usd::SchemaRegistry>> {
+    static SITE: &usd::SchemaFamily<'_> = &usd::SchemaFamily::new("site", &[]).kinds(&[
+        kind::Decl::new("chargroup").base("assembly"),
+        kind::Decl::new("prop").base("component"),
+        kind::Decl::new("rig").base("model"),
+        kind::Decl::new("rivet").base("subcomponent"),
+        kind::Decl::new("site_root"),
+    ]);
+    Ok(usd::SchemaRegistry::builder().register(SITE).build()?)
+}
+
+fn open_custom_kinds() -> Result<Stage> {
+    Stage::builder()
+        .schema_registry(custom_kinds_registry()?)
+        .open("fixtures/custom_kinds.usda")
+}
+
+const MODEL: (bool, bool, bool) = (true, false, false);
+const GROUP: (bool, bool, bool) = (true, true, false);
+const COMPONENT: (bool, bool, bool) = (true, false, true);
+const NOT_MODEL: (bool, bool, bool) = (false, false, false);
+
+/// The pseudo-root is a model group, and `kind = "model"` under a group is a
+/// model that is neither a group nor a component (C++
+/// `Usd_PrimData::_ComposeAndCacheFlags`).
+#[test]
+fn model_root_and_base() -> Result<()> {
+    let stage = Stage::open("fixtures/custom_kinds.usda")?;
+    assert_eq!(model_flags(&stage, "/")?, GROUP);
+    assert_eq!(model_flags(&stage, "/BuiltIn")?, GROUP);
+    assert_eq!(model_flags(&stage, "/BuiltIn/Leaf")?, COMPONENT);
+    assert_eq!(model_flags(&stage, "/BuiltIn/Abstract")?, MODEL);
+    Ok(())
+}
+
+#[test]
+fn model_custom_kinds() -> Result<()> {
+    let stage = open_custom_kinds()?;
+
+    // A kind derived from `assembly` is a group, so its children are models.
+    assert_eq!(model_flags(&stage, "/Show")?, GROUP);
+    assert_eq!(model_flags(&stage, "/Show/Hero")?, COMPONENT);
+    assert_eq!(model_flags(&stage, "/Show/Squad")?, GROUP);
+    assert_eq!(model_flags(&stage, "/Show/Squad/Unit")?, COMPONENT);
+    // One derived from `model` itself is a model and nothing more.
+    assert_eq!(model_flags(&stage, "/Show/Rig")?, MODEL);
+
+    // A root kind is no model, and nothing under it is one.
+    assert_eq!(model_flags(&stage, "/Show/Marker")?, NOT_MODEL);
+    assert_eq!(model_flags(&stage, "/Show/Marker/Prop")?, NOT_MODEL);
+
+    // A kind derived from `subcomponent` is one wherever it sits.
+    let rivet = stage.prim("/Show/Hero/Rivet")?;
+    assert!(rivet.is_subcomponent()? && !rivet.is_model()?);
+    assert!(!stage.prim("/Show/Hero")?.is_subcomponent()?);
+    Ok(())
+}
+
+#[test]
+fn model_custom_kind_instance() -> Result<()> {
+    let stage = open_custom_kinds()?;
+    let proto = stage.prim("/Show/Crowd")?.prototype()?.expect("Crowd is an instance");
+    assert_eq!(model_flags(&stage, proto.as_str())?, GROUP);
+
+    let member = proto.append_path("Member")?;
+    assert_eq!(model_flags(&stage, member.as_str())?, COMPONENT);
+    // The instance is a group by its own kind, the referenced `chargroup`,
+    // and the proxy answers as the prototype's prim.
+    assert_eq!(model_flags(&stage, "/Show/Crowd")?, GROUP);
+    assert_eq!(model_flags(&stage, "/Show/Crowd/Member")?, COMPONENT);
+    Ok(())
+}
+
+/// Without the declarations, every answer that rests on one is `false`. What
+/// rests on none keeps its answer: the pseudo-root, a prototype root, and the
+/// built-in kinds under a built-in group.
+#[test]
+fn model_kinds_undeclared() -> Result<()> {
+    let stage = Stage::open("fixtures/custom_kinds.usda")?;
+    for path in [
+        "/Show",
+        "/Show/Hero",
+        "/Show/Rig",
+        "/Show/Marker",
+        "/Show/Marker/Prop",
+        "/Show/Squad",
+        "/Show/Squad/Unit",
+        "/Show/Crowd",
+        "/Show/Crowd/Member",
+    ] {
+        assert_eq!(model_flags(&stage, path)?, NOT_MODEL, "{path}");
+    }
+    assert!(!stage.prim("/Show/Hero/Rivet")?.is_subcomponent()?);
+
+    assert_eq!(model_flags(&stage, "/")?, GROUP);
+    assert_eq!(model_flags(&stage, "/BuiltIn/Leaf")?, COMPONENT);
+    let proto = stage.prim("/Show/Crowd")?.prototype()?.expect("Crowd is an instance");
+    assert_eq!(model_flags(&stage, proto.as_str())?, GROUP);
+    let member = proto.append_path("Member")?;
+    assert_eq!(model_flags(&stage, member.as_str())?, NOT_MODEL);
+    Ok(())
+}
+
+/// An ancestor's `kind` is read live: a descendant leaves the model hierarchy
+/// when the ancestor stops being a group and rejoins it when it is one again.
+#[test]
+fn model_follows_kind_edit() -> Result<()> {
+    let stage = open_custom_kinds()?;
+    assert_eq!(model_flags(&stage, "/Show/Hero")?, COMPONENT);
+    assert_eq!(model_flags(&stage, "/Show/Squad")?, GROUP);
+
+    stage.prim("/Show")?.set_kind("site_root")?;
+    assert_eq!(model_flags(&stage, "/Show")?, NOT_MODEL);
+    assert_eq!(model_flags(&stage, "/Show/Hero")?, NOT_MODEL);
+    assert_eq!(model_flags(&stage, "/Show/Squad")?, NOT_MODEL);
+    assert_eq!(model_flags(&stage, "/Show/Squad/Unit")?, NOT_MODEL);
+
+    stage.prim("/Show")?.set_kind("chargroup")?;
+    assert_eq!(model_flags(&stage, "/Show")?, GROUP);
+    assert_eq!(model_flags(&stage, "/Show/Hero")?, COMPONENT);
+    assert_eq!(model_flags(&stage, "/Show/Squad")?, GROUP);
+    assert_eq!(model_flags(&stage, "/Show/Squad/Unit")?, COMPONENT);
+    Ok(())
+}
+
+/// Two stages over one file, open together, each answer by their own
+/// registry.
+#[test]
+fn model_kinds_per_stage() -> Result<()> {
+    let declared = open_custom_kinds()?;
+    let plain = Stage::open("fixtures/custom_kinds.usda")?;
+    for _ in 0..2 {
+        assert_eq!(model_flags(&declared, "/Show/Hero")?, COMPONENT);
+        assert_eq!(model_flags(&plain, "/Show/Hero")?, NOT_MODEL);
+        assert_eq!(model_flags(&declared, "/Show")?, GROUP);
+        assert_eq!(model_flags(&plain, "/Show")?, NOT_MODEL);
+    }
+    Ok(())
+}
+
 #[test]
 fn prim_status_bits() -> Result<()> {
     let stage = open_stage_queries_fixture()?;
@@ -5664,7 +6377,7 @@ fn traverse_all_predicate() -> Result<()> {
     stage.traverse(PrimPredicate::ALL, |p| prims.push(p.as_str().to_string()))?;
 
     assert!(prims.contains(&"/World/InactiveParent".to_string()));
-    assert!(prims.contains(&"/World/InactiveParent/Child".to_string()));
+    assert!(!prims.contains(&"/World/InactiveParent/Child".to_string()));
     assert!(prims.contains(&"/World/OverOnly".to_string()));
     assert!(prims.contains(&"/World/OverParent/Child".to_string()));
     assert!(prims.contains(&"/World/ClassParent".to_string()));
@@ -12235,6 +12948,11 @@ fn instancing_edits_refused() -> Result<()> {
     ));
     assert!(matches!(
         stage.define_prim("/Inst/Child/New"),
+        Err(StageAuthoringError::InstanceProxyEdit { .. })
+    ));
+    // Beneath an instance is refused on the path alone, where no prim composes.
+    assert!(matches!(
+        stage.define_prim("/Inst/Missing/New"),
         Err(StageAuthoringError::InstanceProxyEdit { .. })
     ));
     let prototype = proxy

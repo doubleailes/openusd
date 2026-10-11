@@ -194,7 +194,7 @@ pub(crate) enum AttributeValueSource {
     /// same value resolves at every time code.
     ///
     /// `Static(None)` is the default source — "this attribute resolves to
-    /// nothing" — which is what a query gated out by the population mask
+    /// nothing" — which is what a query on a prim the stage does not hold
     /// returns.
     Static(Option<Value>),
     /// A time-sampled source — the matched map, its node's layer offset, and
@@ -240,9 +240,9 @@ impl Default for AttributeValueSource {
 /// one borrow, so no edit can land between the answer and the token that guards
 /// it.
 ///
-/// The default — no value, no revision — is what a query gated out by the
-/// population mask resolves to (`Stage::masked`): a masked prim composes no
-/// index, so there is nothing to validate against and nothing to memoize.
+/// The default — no value, no revision — is what a query on a prim the stage
+/// does not hold resolves to (`Stage::masked`): such a prim composes no index,
+/// so there is nothing to validate against and nothing to memoize.
 #[derive(Default)]
 pub(crate) struct StampedValueSource {
     /// The composed prim the source resolved from. For an instance proxy this
@@ -1480,8 +1480,8 @@ impl IndexCache {
         interp: &dyn Fn(&sdf::TimeSampleMap, f64) -> Option<Value>,
     ) -> Result<Resolution, QueryError> {
         let Some((prim, suffix)) = self.ensure_attr_index(graph, attr_path)? else {
-            // Nothing authored, nothing blocked: what a prim the population mask
-            // excludes resolves to, so the masked path needs no special case.
+            // Nothing authored, nothing blocked: what a prim the stage does
+            // not hold resolves to, so the gated path needs no special case.
             return Ok(Resolution::default());
         };
         let mut resolver = InfoResolver {
@@ -1957,12 +1957,21 @@ impl IndexCache {
     /// arc had culled as empty now composes — so the caller reports them as
     /// resynced. Which of the two partitions a prim landed in says how the cache
     /// caught up, not whether a consumer must.
+    ///
+    /// A node an arc introduced that gains or loses its specs enters or leaves
+    /// its prim's instance key (C++ `Pcp_ChildNodeInstanceableChanged`). The
+    /// key an instance registered under then differs from the one its index
+    /// gives, and a prototype seeded from that instance carries a node its
+    /// other instances do not share. The rescan retires the prototype of every
+    /// registered instance and prototype root it reached that way, and the
+    /// retired roots join the returned paths.
     pub(super) fn rescan_specs(&mut self, graph: &LayerGraph, sites: &[(LayerId, Path)]) -> Vec<Path> {
         let mut refreshed: HashMap<Path, NodeRuns> = HashMap::new();
         let mut rebuild: HashSet<Path> = HashSet::new();
+        let mut rekeyed: HashSet<Path> = HashSet::new();
         for (layer, path) in sites {
             self.store
-                .refresh_specs(graph, *layer, path, &mut refreshed, &mut rebuild);
+                .refresh_specs(graph, *layer, path, &mut refreshed, &mut rebuild, &mut rekeyed);
         }
         for prim in &rebuild {
             self.store.remove(prim);
@@ -1970,7 +1979,18 @@ impl IndexCache {
         // An index condemned after an earlier site had already refreshed it kept
         // its runs out of the map, so the two sets are disjoint by construction.
         let touched = self.store.splice_spec_stacks(graph, refreshed);
-        rebuild.into_iter().chain(touched).collect()
+        // Only a registered instance or a prototype root has a key to go stale;
+        // any other prim's flip is caught up by the refresh alone.
+        let rekeyed: Vec<Path> = rekeyed
+            .into_iter()
+            .filter(|prim| self.prototypes.is_registered(prim))
+            .collect();
+        let retired = if rekeyed.is_empty() {
+            Vec::new()
+        } else {
+            self.invalidate_prototypes(&rekeyed)
+        };
+        rebuild.into_iter().chain(touched).chain(retired).collect()
     }
 
     /// Drop a prim's cached index and every namespace descendant. Used by
@@ -2466,10 +2486,9 @@ impl IndexCache {
     /// [`crate::usd::ConnectionGraph::resolve_chain`]) so a deep relationship
     /// chain cannot overflow the call stack.
     ///
-    /// A target relationship on a prim the population mask excludes is not
-    /// followed — its raw targets would be empty under the mask anyway — so the
-    /// forwarded result never leaks scene the mask excludes (it stays
-    /// consistent with [`Self::relationship_targets`] on that path).
+    /// A target on a prim the stage does not hold — outside the population
+    /// mask, or below an inactive prim — is kept as-is without composing that
+    /// prim, as C++ keeps a target whose `GetPrimAtPath` is invalid.
     pub fn forwarded_relationship_targets(&mut self, graph: &LayerGraph, path: &Path) -> Result<Vec<Path>, QueryError> {
         let mut out = Vec::new();
         let mut emitted = HashSet::new();
@@ -2482,18 +2501,17 @@ impl IndexCache {
         let mut stack: Vec<Path> = self.relationship_targets(graph, path)?.into_iter().rev().collect();
         while let Some(target) = stack.pop() {
             // Only property targets can be relationships; a prim-path target is
-            // always terminal. Classify property targets by composed spec type.
-            // A prototype root has no properties at the stage tier (C++ reads it
-            // through an empty prim index), so a target on one is terminal too.
-            let is_relationship = target.is_property_path()
-                && !self.is_prototype(&target.prim_path())
-                && matches!(self.spec_type(graph, &target)?, Some(SpecType::Relationship));
+            // always terminal. Classify property targets by composed spec type,
+            // once the population is known to reach the prim. A prototype root
+            // has no properties at the stage tier (C++ reads it through an
+            // empty prim index), so a target on one is terminal too.
+            let is_relationship = target.is_property_path() && {
+                let prim = target.prim_path();
+                self.population_reaches(graph, &prim)?
+                    && !self.is_prototype(&prim)
+                    && matches!(self.spec_type(graph, &target)?, Some(SpecType::Relationship))
+            };
             if is_relationship {
-                // Don't follow a relationship the mask excludes; a masked-out
-                // prim contributes no composed targets.
-                if !self.mask_includes(&target.prim_path()) {
-                    continue;
-                }
                 if !followed.insert(target.clone()) {
                     continue; // already followed — break the cycle
                 }
@@ -2796,7 +2814,8 @@ impl IndexCache {
         let names = self.compute_prim_child_names(graph, path)?.0;
         // Filtered here, where the list is produced, so no caller can compose a
         // child list the population mask has not been applied to — C++ masks
-        // inside `_ComposeChildren` for the same reason.
+        // inside `_ComposeChildren` for the same reason. Activeness is applied
+        // by [`Self::populated_children`].
         Ok(self.filter_child_names(path, names))
     }
 
@@ -2831,7 +2850,7 @@ impl IndexCache {
 
         // An instance prim's children come only from its composition arcs;
         // opinions authored at the instance's own namespace — the local root and
-        // the ancestral references above the instanceable arc — are discarded
+        // the ancestral arcs the instance is nested under — are discarded
         // (spec 11.3.3). The instance prim's own index is otherwise left intact.
         let drop_local = self.is_instance(graph, &path)?;
 
@@ -3305,25 +3324,25 @@ impl IndexCache {
         // `within_instance`, so the local arcs are never followed — rather than
         // pruned afterwards, which would leave the nodes those local arcs spawned.
 
-        // Inside an instance, the ancestral references the instance prim is
-        // nested under contribute opinions at the instance's own namespace that
-        // must not leak into the shared subtree (spec 11.3.3). The indexer
-        // already inerted the local root for an instance descendant; this inerts
-        // those outer references too (the C++ `!HasTransitiveDirectDependency`
-        // nodes), leaving only the instanceable arc, its descendants, and the
-        // implied classes. Runs before deriving instance state below so the
+        // Inside an instance, the ancestral arcs the instance prim is nested
+        // under contribute opinions at the instance's own namespace that must
+        // not leak into the shared subtree (spec 11.3.3). The indexer already
+        // inerted the local root for an instance descendant; this inerts those
+        // outer arcs too (the C++ `!HasTransitiveDirectDependency` nodes),
+        // leaving only the arcs introduced at the instance and their subtrees.
+        // Runs before deriving instance state below so the
         // suppressed opinions are already inert.
         if let Some(depth) = parent_ctx.instance_depth {
             index.mark_instance_local_inert(path.prim_element_count() as u16, depth);
         }
 
         // This prim is an instance when its composition declares
-        // `instanceable = true` and carries an arc; its descendants then
+        // `instanceable = true` and has an instanceable node; its descendants then
         // inherit `within_instance`. A nested instance therefore re-arms the
         // flag for its own subtree. Computed from the freshly built index so it
         // agrees with a later `Prim::is_instance`, avoiding re-entering
         // `ensure_index` for `path`.
-        let is_instance = index.has_composition_arc()
+        let is_instance = index.has_instanceable_node(path.prim_element_count() as u16)
             && matches!(
                 index.resolve_field(FieldKey::Instanceable.as_str(), graph, None)?,
                 Some(Value::Bool(true))

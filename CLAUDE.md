@@ -117,16 +117,26 @@ source of truth for specifics.
 
 - **`openusd-build`** - A separate crate (`crates/openusd-build`): the schema
   view generator `openusd-schemas` runs as a build dependency. It loads a schema
-  library's schematics and manifest, resolves and validates them over the
-  composed stage, and emits the Rust views and token tables the schema crate
+  library's schematics and manifest, and the metadata fields and kinds its
+  `plugInfo.json` declares, resolves and validates them over the composed
+  stage, and emits the Rust views and token tables the schema crate
   includes (`load` → `resolve` → `validate` → `emit`; start at its `lib.rs`).
   Its golden tests under `tests/` regenerate with `UPDATE_EXPECTED=1`.
+
+- **`kind`** - Kinds (C++ `Kind`): `kind::Registry` (C++ `KindRegistry`) is
+  the table of known kinds and their base kinds, holding the built-in model
+  hierarchy plus the kinds a site declares as `kind::Decl`s. It is the single
+  file `kind.rs` and depends on `tf` only. A schema family carries the
+  declarations (`usd::SchemaFamily::kinds`), and a stage reads the table
+  through `usd::SchemaRegistry::kinds`.
 
 - **`gf/`** - Graphics Foundations (C++ `Gf`): `bytemuck::Pod` vector /
   quaternion / matrix types for bulk binary serialization, row-major /
   row-vector convention, each bridging to `sdf::Value` via `From` / `TryFrom`;
-  and `gf::Interval` (C++ `GfInterval`), the open-or-closed-ended span a
-  time-sample query is asked over. See `gf/mod.rs` for the conventions.
+  `gf::Rotation` (C++ `GfRotation`), the axis-and-angle rotation the xformOp
+  rotations are built through; and `gf::Interval` (C++ `GfInterval`), the
+  open-or-closed-ended span a time-sample query is asked over. See `gf/mod.rs`
+  for the conventions.
 
 ## Development Commands
 
@@ -346,8 +356,8 @@ Key external dependencies:
 - `half` - 16-bit floating point support (re-exported as `f16`)
 - `logos` - Lexer generator for USDA tokenization
 - `lz4_flex` - Compression for binary format
-- `memmap2` (optional, `mmap` feature, on by default) - Read-only file
-  mappings a resolver opts into with `ar::DefaultResolver::map_files`
+- `memmap2` (optional, `mmap` feature) - Read-only file mappings a resolver
+  opts into with `ar::DefaultResolver::map_files`
 - `num-traits` - Numeric traits
 - `regex-lite` - Lightweight regex engine for the `matches_regex` expression
   function

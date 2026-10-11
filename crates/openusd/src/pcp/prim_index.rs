@@ -167,6 +167,10 @@ pub(crate) struct SpecRefresh {
     /// contributing arc target lost its last spec (cull it like an always-empty
     /// target).
     pub needs_rebuild: bool,
+    /// A node an arc introduced gained its first spec or lost its last. Such a
+    /// node enters or leaves an instance's key (C++
+    /// `Pcp_ChildNodeInstanceableChanged`).
+    pub arc_specs_changed: bool,
 }
 
 /// The spec runs a change round refreshed on one index: one entry per node the
@@ -543,6 +547,7 @@ impl PrimIndex {
                 let cullable = node.arc != ArcType::Root && !node.is_inert();
                 refresh.needs_rebuild |= lost_last_spec && cullable;
             }
+            refresh.arc_specs_changed |= node.arc != ArcType::Root && node.has_specs != has_specs;
             node.has_specs = has_specs;
         }
         refresh
@@ -733,21 +738,23 @@ impl PrimIndex {
     /// absolute level the arc was introduced at; the level follows from the two.
     ///
     /// This is the C++ `!PcpNodeRef::HasTransitiveDirectDependency` partition.
-    /// Instance-local = the local root plus the contiguous *trunk* of ancestral
-    /// references/payloads the instance prim is nested under — the outer arcs
-    /// reaching down to, but stopping above, the instanceable arc. The
-    /// instanceable arc (the first reference/payload introduced at the instance's
-    /// own depth) and everything below it stay shared, as do the implied classes
-    /// (class-based arcs).
+    /// Instance-local = the local root plus every node whose arc was introduced
+    /// strictly above the instance and whose parent is instance-local too: the
+    /// ancestral arcs of every kind (references, payloads, inherits,
+    /// specializes, variants) the instance prim is nested under. A node whose arc
+    /// was introduced at the instance's own depth or below is shared, and so is
+    /// its whole subtree, ancestral opinions it pulled in included — as C++ marks
+    /// a node added while indexing the prim as a direct dependency and
+    /// propagates the mark down its subtree, while every node the prim index
+    /// inherits from its parent's starts out as not direct.
     ///
-    /// Trunk membership is structural: a node is on the trunk only if its arc was
-    /// introduced strictly above the instance *and* its parent is also on the
-    /// trunk. The parent check makes the trunk contiguous, which is what keeps a
-    /// reference or payload nested inside the prototype shared along with the
-    /// implied classes an outer arc helped derive.
+    /// The parent check is what keeps a direct arc's subtree shared. An implied
+    /// class an ancestral arc derived is instance-local like that arc: its path
+    /// is the instance's own namespace under the class, so it names the instance
+    /// and contributes nothing the prototype can share.
     ///
     /// The arena is append-only with each node's parent preceding it, so one
-    /// forward pass propagates trunk-ness parent→child.
+    /// forward pass propagates locality parent→child.
     pub(crate) fn instance_local_nodes(&self, prim_depth: u16, instance_depth: u16) -> Vec<bool> {
         // An arc introduced at the instance or below leaves this many namespace
         // levels between its introduction and the prim being composed; anything
@@ -766,14 +773,38 @@ impl PrimIndex {
             local[i] = match node.arc {
                 // The local site (and the synthetic root) is always instance-local.
                 ArcType::Root => true,
-                ArcType::Reference | ArcType::Payload => {
+                _ => {
                     self.graph.depth_below_introduction(NodeId(i as u32)) > below_instance
                         && node.parent.is_some_and(|p| local[p.idx()])
                 }
-                _ => false,
             };
         }
         local
+    }
+
+    /// Classifies each node as instanceable (`true`) or not for an instance prim
+    /// at `instance_depth` whose index this is (C++
+    /// `Pcp_ChildNodeIsInstanceable`), indexed by [`NodeId`] arena position. An
+    /// instanceable node is shared
+    /// ([`instance_local_nodes`](Self::instance_local_nodes)), able to
+    /// contribute opinions, and authors a spec at its site: the nodes that bring
+    /// a prototype its content.
+    pub(crate) fn instanceable_nodes(&self, instance_depth: u16) -> Vec<bool> {
+        let local = self.instance_local_nodes(instance_depth, instance_depth);
+        self.graph
+            .nodes
+            .iter()
+            .zip(local)
+            .map(|(node, local)| !local && !node.is_inert() && !node.is_culled() && node.has_specs())
+            .collect()
+    }
+
+    /// Whether this index, composing a prim at `depth`, has any instanceable
+    /// node ([`instanceable_nodes`](Self::instanceable_nodes)). The structural
+    /// half of C++ `Pcp_PrimIndexIsInstanceable`: a prim whose only arcs are
+    /// ancestral, or bring no opinions, has nothing a prototype could share.
+    pub(crate) fn has_instanceable_node(&self, depth: u16) -> bool {
+        self.instanceable_nodes(depth).contains(&true)
     }
 
     /// Inerts the instance-namespace opinions on a prim composed inside an
@@ -783,8 +814,8 @@ impl PrimIndex {
     /// prim's; the partition is
     /// [`instance_local_nodes`](Self::instance_local_nodes).
     ///
-    /// Each node is inerted individually, not its subtree: the implied classes a
-    /// dropped reference helped derive are children in the graph yet stay shared.
+    /// Each node is inerted individually, not its subtree: a direct arc nested
+    /// under a dropped ancestral one is a child in the graph yet stays shared.
     /// (The local root is also inerted earlier by the indexer via
     /// [`CompositionContext::within_instance`](super::prim_index::CompositionContext::within_instance).)
     pub(crate) fn mark_instance_local_inert(&mut self, prim_depth: u16, instance_depth: u16) {

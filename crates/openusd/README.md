@@ -47,7 +47,7 @@ Add the crate to your `Cargo.toml` (or run `cargo add openusd`):
 
 ```toml
 [dependencies]
-openusd = "0.7"
+openusd = "0.8"
 ```
 
 If you need the latest unreleased changes, depend on the crate directly from the
@@ -69,7 +69,7 @@ openusd = { git = "https://github.com/mxpv/openusd.git", rev = "4c02084" }
 
 | Feature | Enables |
 |---------|---------|
-| `mmap` (default) | Memory-mapped reads of layer files, enabled per resolver with `ar::DefaultResolver::map_files` |
+| `mmap` | Memory-mapped reads of layer files, enabled per resolver with `ar::DefaultResolver::map_files` |
 | `serde` | `serde` support for serializing core types |
 
 ## Example
