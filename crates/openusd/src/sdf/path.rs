@@ -1,7 +1,8 @@
-use std::hash::{DefaultHasher, Hash, Hasher};
-use std::ops::Deref;
-use std::sync::{Arc, LazyLock};
-use std::{cmp, convert::Infallible, fmt, str::FromStr};
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::hash::{BuildHasherDefault, DefaultHasher, Hash, Hasher};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, Weak};
+use std::{array, cmp, convert::Infallible, fmt, ptr, str::FromStr};
 
 use crate::tf;
 
@@ -44,42 +45,99 @@ pub fn try_into_path(path: impl IntoPath) -> Result<Path, PathParseError> {
 /// rejects malformed text with a [`PathParseError`]. The empty path is not
 /// parseable; construct it with [`Path::default`].
 ///
-/// Clones share the path's text, as C++ `SdfPath` copies share one pooled
-/// path node, and the empty and absolute root paths share one text each
-/// however they are reached.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Path {
-    path: Arc<Text>,
-}
-
-/// The text of the empty path, shared by every [`Path::default`].
-static EMPTY: LazyLock<Arc<Text>> = LazyLock::new(|| Arc::new(Text::new(String::new())));
-
-/// The text of the absolute root path, shared by every [`Path::abs_root`].
-static ABS_ROOT: LazyLock<Arc<Text>> = LazyLock::new(|| Arc::new(Text::new(String::from("/"))));
-
-/// A path's shared text and its hash.
+/// Paths are interned, as C++ `SdfPath` pools its path nodes: every path
+/// spelled the same shares one node, and equality compares node pointers.
+/// Each node links to its parent's node, which [`parent`](Self::parent) and
+/// [`ancestors`](Self::ancestors) follow. A node lives while a path refers
+/// to it or to one of its descendants.
 ///
-/// Clones of a [`Path`] share one `Text`, whose hash is computed once, when
-/// the path is made. A path keying several maps, or one map many times, does
-/// not read its text again to hash it. Equality and ordering compare the text.
-struct Text {
-    text: String,
-    /// The text's hash under a fixed-key hasher. Equal texts in separate
-    /// allocations hash alike.
-    hash: u64,
+/// Hashing writes a hash of the text, computed once when the node is made.
+/// Ordering compares the text. Both agree across runs.
+#[derive(Debug, Clone)]
+pub struct Path {
+    node: Arc<Node>,
 }
+
+/// The node behind every [`Path`] spelled the same (C++ `Sdf_PathNode`).
+///
+/// [`NODES`] holds one live node per text. A node holds its parent's node,
+/// whose text prefixes its own.
+struct Node {
+    text: Box<str>,
+    /// The text's hash under a fixed-key hasher: equal texts hash alike in
+    /// every run.
+    hash: u64,
+    /// The node of [`Path::parent`].
+    parent: Option<Path>,
+    /// Whether the path is a property path ([`Path::is_property`]).
+    property: bool,
+}
+
+/// The empty path, kept so [`Path::default`] takes no lock.
+static EMPTY: LazyLock<Path> = LazyLock::new(|| Path::intern(""));
+
+/// The absolute root path, kept so [`Path::abs_root`] takes no lock.
+static ABS_ROOT: LazyLock<Path> = LazyLock::new(|| Path::intern("/"));
+
+/// Number of [`Shard`]s in [`NODES`].
+const SHARDS: usize = 16;
+
+/// The table of live [`Node`]s, split into shards each behind its own lock
+/// so threads interning different paths rarely contend.
+static NODES: LazyLock<[Mutex<Shard>; SHARDS]> = LazyLock::new(|| array::from_fn(|_| Mutex::default()));
+
+/// One shard of [`NODES`]: the nodes whose hash selects it, keyed by that
+/// hash. A node removes its own entry when dropped.
+#[derive(Default)]
+struct Shard {
+    nodes: HashMap<u64, Weak<Node>, BuildHasherDefault<Prehashed>>,
+    /// Nodes whose hash a different live node holds in `nodes`.
+    collided: Vec<Weak<Node>>,
+}
+
+/// A hasher for keys that are hashes already: it passes the `u64` through.
+#[derive(Default)]
+struct Prehashed(u64);
 
 impl Default for Path {
     /// The empty path.
     fn default() -> Self {
-        Path { path: EMPTY.clone() }
+        EMPTY.clone()
+    }
+}
+
+impl PartialEq for Path {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.node, &other.node)
+    }
+}
+
+impl Eq for Path {}
+
+impl Hash for Path {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.node.hash);
+    }
+}
+
+impl PartialOrd for Path {
+    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Path {
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        if self == other {
+            return cmp::Ordering::Equal;
+        }
+        self.as_str().cmp(other.as_str())
     }
 }
 
 impl fmt::Display for Path {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.path)
+        f.write_str(self.as_str())
     }
 }
 
@@ -126,7 +184,7 @@ impl FromStr for Path {
 
     fn from_str(s: &str) -> Result<Path, Self::Err> {
         Path::validate(s)?;
-        Ok(Path::from_text(s.to_owned()))
+        Ok(Path::intern(s))
     }
 }
 
@@ -141,14 +199,35 @@ impl Path {
     /// The absolute root path `/` (pseudo-root).
     #[inline]
     pub fn abs_root() -> Path {
-        Path { path: ABS_ROOT.clone() }
+        ABS_ROOT.clone()
     }
 
-    /// Wraps already-validated `text`.
-    fn from_text(text: String) -> Path {
-        Path {
-            path: Arc::new(Text::new(text)),
+    /// The path spelled by already-validated `text`: its live node, or else
+    /// a new node linked to its parent's, which is interned first.
+    fn intern(text: &str) -> Path {
+        let hash = hash_text(text);
+        // The nodes `find` reads to compare, declared ahead of every shard
+        // guard so they drop after it.
+        let mut others = Vec::new();
+        if let Some(path) = lock_shard(hash).find(hash, text, &mut others) {
+            return path;
         }
+        // The parent is interned outside the lock, as it may hash to the
+        // same shard.
+        let parent = parent_len(text).map(|len| Path::intern(&text[..len]));
+        let mut shard = lock_shard(hash);
+        // Another thread may have interned `text` since the lookup.
+        if let Some(path) = shard.find(hash, text, &mut others) {
+            return path;
+        }
+        let node = Arc::new(Node {
+            text: text.into(),
+            hash,
+            parent,
+            property: ends_in_property(text),
+        });
+        shard.insert(&node);
+        Path { node }
     }
 
     /// Wraps `path` without validating it — the fast path for strings a
@@ -164,13 +243,13 @@ impl Path {
         match path {
             "" => Path::default(),
             "/" => Path::abs_root(),
-            _ => Path::from_text(path.to_owned()),
+            _ => Path::intern(path),
         }
     }
 
     #[inline]
     pub fn is_abs(&self) -> bool {
-        self.path.starts_with('/')
+        self.as_str().starts_with('/')
     }
 
     /// Returns `true` if this is the absolute root path `/` (pseudo-root).
@@ -189,14 +268,14 @@ impl Path {
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.path.is_empty()
+        self.as_str().is_empty()
     }
 
     pub fn append_property(&self, property: impl Into<tf::Token>) -> Result<Path, PathParseError> {
         let property = property.into();
         let property = property.as_str();
         let fail = |offset, reason| PathParseError {
-            input: format!("{}.{property}", self.path),
+            input: format!("{self}.{property}"),
             offset,
             reason,
         };
@@ -206,21 +285,21 @@ impl Path {
         // The pseudo-root, the empty path, and the `.`/`..` relative anchors
         // cannot own properties; appending to them would build an unparseable
         // path like `/.foo`.
-        if self.is_empty() || self.is_abs_root() || self.as_str() == "." || self.path.ends_with("..") {
+        if self.is_empty() || self.is_abs_root() || self.as_str() == "." || self.as_str().ends_with("..") {
             return Err(fail(0, "path cannot own properties"));
         }
         if !Path::is_valid_namespace_identifier(property) {
             return Err(fail(
-                self.path.len() + 1,
+                self.as_str().len() + 1,
                 "property name is not a valid namespaced identifier",
             ));
         }
 
-        let mut new_path = self.path.to_string();
+        let mut new_path = self.as_str().to_string();
         new_path.push('.');
         new_path.push_str(property);
 
-        Ok(Path::from_text(new_path))
+        Ok(Path::intern(&new_path))
     }
 
     /// Appends `path` (parsed if given as a string) under this path with a `/`
@@ -231,7 +310,7 @@ impl Path {
 
         if self.is_abs() && append.is_abs() {
             return Err(PathParseError {
-                input: append.path.to_string(),
+                input: append.as_str().to_string(),
                 offset: 0,
                 reason: "cannot append an absolute path to an absolute path",
             });
@@ -239,8 +318,8 @@ impl Path {
 
         if self.is_property() {
             return Err(PathParseError {
-                input: self.path.to_string(),
-                offset: self.path.rfind('.').unwrap_or(0),
+                input: self.as_str().to_string(),
+                offset: self.as_str().rfind('.').unwrap_or(0),
                 reason: "cannot append a path to a property path",
             });
         }
@@ -261,7 +340,7 @@ impl Path {
         // a valid path.
         if append.as_str().starts_with('.') {
             return Err(PathParseError {
-                input: append.path.to_string(),
+                input: append.as_str().to_string(),
                 offset: 0,
                 reason: "cannot append a `.`-anchored path under a prim path",
             });
@@ -270,32 +349,23 @@ impl Path {
         // If base is slash only.
         // "/" + "foo/bar" => "/foo/bar"
         let combined = if self.as_str() == "/" {
-            format!("/{}", append.path)
+            format!("/{append}")
         } else if self.is_variant_selection() {
             // A prim child attaches directly to a variant selection with no
             // separator: "/A{v=s}" + "B" => "/A{v=s}B" (C++ SdfPath::AppendChild).
-            format!("{}{}", self.path, append.path)
+            format!("{self}{append}")
         } else {
-            format!("{}/{}", self.path, append.path)
+            format!("{self}/{append}")
         };
 
-        Ok(Path::from_text(combined))
+        Ok(Path::intern(&combined))
     }
 
+    /// Returns `true` if this path ends in a property name, e.g. `/A.attr`
+    /// or `/A.rel[/T].attr`.
+    #[inline]
     pub fn is_property(&self) -> bool {
-        let pos = match self.path.rfind('.') {
-            Some(index) => index,
-            // No dot, not a property path
-            None => return false,
-        };
-
-        // The final dot must be followed by a valid property name: identifier
-        // characters plus `:` for namespaced properties like
-        // `primvars:displayColor` — the same alphabet the path validator
-        // accepts. A tail carrying structural characters (`}`, `]`) belongs to
-        // a variant selection or target path, not a property.
-        let tail = &self.path[pos + 1..];
-        !tail.is_empty() && tail.chars().all(|c| c == ':' || is_identifier_cont(c))
+        self.node.property
     }
 
     /// Returns `true` if this path's final component is a variant selection,
@@ -305,7 +375,7 @@ impl Path {
     /// path identifies a variant spec, not a prim, so it is not a valid target
     /// for prim authoring.
     pub fn is_variant_selection(&self) -> bool {
-        self.path.ends_with('}')
+        self.as_str().ends_with('}')
     }
 
     /// Returns `true` if this path names a prim.
@@ -322,7 +392,7 @@ impl Path {
     /// path.
     pub fn is_prim(&self) -> bool {
         // The relative anchors: `.`, and a `..(/..)*` run with nothing after it.
-        if self.as_str() == "." || (!self.path.is_empty() && self.path.split('/').all(|seg| seg == "..")) {
+        if self.as_str() == "." || (!self.as_str().is_empty() && self.as_str().split('/').all(|seg| seg == "..")) {
             return true;
         }
         // Strip the anchor the grammar allows ahead of the prim chain, then ask
@@ -370,7 +440,7 @@ impl Path {
         // `{set=sel}` segment, so a depth-0 scan decides without parsing
         // components (which relative `..` prefixes would stop short).
         let mut depth = 0usize;
-        for byte in self.path.bytes() {
+        for byte in self.as_str().bytes() {
             match byte {
                 b'[' => depth += 1,
                 b']' => depth = depth.saturating_sub(1),
@@ -381,50 +451,28 @@ impl Path {
         false
     }
 
+    /// Returns the prim this path names or belongs to: the path itself for a
+    /// prim, the owning prim of a property, and the prim a trailing variant
+    /// selection qualifies.
     pub fn prim_path(&self) -> Path {
-        // Split at last slash.
-        // "/A/B/C.foo[target].bar:baz" will become "/A/B" and "C.foo[target].bar:baz"
-        let Some((before, after)) = self.path.rsplit_once('/') else {
-            // Relative single segment (no slash): strip a trailing property or
-            // variant selection. `is_property` separates `Foo.bar` from a
-            // relative `..`, which has no property tail and is its own prim.
-            if self.is_property()
-                && let Some(dot) = find_component_dot(&self.path)
-            {
-                return Path::from_str_unchecked(&self.path[..dot]);
+        self.prefix(prim_len(self.as_str()))
+    }
+
+    /// The path spelled by the first `len` bytes of this one's text, which
+    /// must end at an element boundary. It is `self` or the ancestor of that
+    /// length when there is one, and is interned otherwise. Every parent's
+    /// text prefixes its child's.
+    fn prefix(&self, len: usize) -> Path {
+        let mut path = self;
+        loop {
+            if path.as_str().len() == len {
+                return path.clone();
             }
-            if self.path.ends_with('}')
-                && let Some(open) = self.path.rfind('{')
-            {
-                return Path::from_str_unchecked(&self.path[..open]);
+            match &path.node.parent {
+                Some(parent) if parent.as_str().len() >= len => path = parent,
+                _ => return Path::from_str_unchecked(&self.as_str()[..len]),
             }
-            return self.clone();
-        };
-
-        // For cases like ../.foo[target].bar, just return ..
-        if after.starts_with('.') {
-            return Path::from_str_unchecked(before);
         }
-
-        // Strip the trailing variant selection, keeping any earlier variants on
-        // the same component: "/A/B/C{set=sel}" => "/A/B/C" and a nested
-        // "/A{x=y}B{p=q}" => "/A{x=y}B" (the last `{` opens the trailing variant).
-        if after.ends_with('}')
-            && let Some(pos) = after.rfind('{')
-        {
-            let sz = before.len() + pos + 1;
-            return Path::from_str_unchecked(&self.path[..sz]);
-        }
-
-        let first_dot = match find_component_dot(after) {
-            Some(dot) => dot,
-            // No dots found, so we have a prim path
-            None => return self.clone(),
-        };
-
-        // Return everything up to the first dot
-        let sz = before.len() + first_dot + 1;
-        Path::from_str_unchecked(&self.path[..sz])
     }
 
     /// Returns the property portion of this path — the trailing segment after
@@ -432,7 +480,7 @@ impl Path {
     /// `.foo[/T].bar` for a target/namespaced property). Empty for a prim
     /// (non-property) path.
     pub fn property_suffix(&self) -> &str {
-        &self.path[self.prim_path().as_str().len()..]
+        &self.as_str()[self.prim_path().as_str().len()..]
     }
 
     /// Splits a property path into its owning prim and the property name (the
@@ -453,7 +501,7 @@ impl Path {
             return None;
         }
         let prim = self.prim_path();
-        let name = self.path[prim.as_str().len()..].strip_prefix('.')?;
+        let name = self.as_str()[prim.as_str().len()..].strip_prefix('.')?;
         Some((prim, name))
     }
 
@@ -472,7 +520,7 @@ impl Path {
     /// `.mapper[..]`) is left untouched.
     pub fn embedded_target(&self) -> Option<Path> {
         let (open, close) = self.target_brackets()?;
-        Some(Path::from_str_unchecked(&self.path[open + 1..close]))
+        Some(Path::from_str_unchecked(&self.as_str()[open + 1..close]))
     }
 
     /// Returns this path with the target path in its first `[..]` bracket
@@ -480,10 +528,10 @@ impl Path {
     /// inverse of [`embedded_target`](Self::embedded_target).
     pub fn replace_embedded_target(&self, new_target: &Path) -> Option<Path> {
         let (open, close) = self.target_brackets()?;
-        let mut replaced = String::with_capacity(self.path.len() + new_target.as_str().len());
-        replaced.push_str(&self.path[..=open]);
+        let mut replaced = String::with_capacity(self.as_str().len() + new_target.as_str().len());
+        replaced.push_str(&self.as_str()[..=open]);
         replaced.push_str(new_target.as_str());
-        replaced.push_str(&self.path[close..]);
+        replaced.push_str(&self.as_str()[close..]);
         Some(Path::from_str_unchecked(&replaced))
     }
 
@@ -491,9 +539,9 @@ impl Path {
     /// when there is no bracket or it is unclosed. Nested brackets are tracked by
     /// depth so a target carrying its own `[..]` is matched whole.
     fn target_brackets(&self) -> Option<(usize, usize)> {
-        let open = self.path.find('[')?;
+        let open = self.as_str().find('[')?;
         let mut depth = 0u32;
-        for (i, byte) in self.path.bytes().enumerate().skip(open) {
+        for (i, byte) in self.as_str().bytes().enumerate().skip(open) {
             match byte {
                 b'[' => depth += 1,
                 b']' => {
@@ -520,7 +568,7 @@ impl Path {
     /// "/A{set=sel}"   -> Some(Variant { set: "set", selection: "sel" })
     /// ```
     pub fn last_element(&self) -> Option<PathElement<'_>> {
-        if self.path.is_empty() || self.as_str() == "/" {
+        if self.as_str().is_empty() || self.as_str() == "/" {
             return None;
         }
         // A property's element is the whole property name (everything after
@@ -560,49 +608,9 @@ impl Path {
     /// "/"           -> None
     /// ""            -> None
     /// ```
+    #[inline]
     pub fn parent(&self) -> Option<Path> {
-        if self.path.is_empty() || self.as_str() == "/" {
-            return None;
-        }
-        // Drop a trailing `{set=sel}` variant selection.
-        if self.is_variant_selection()
-            && let Some(open) = self.path.rfind('{')
-        {
-            return Some(Path::from_str_unchecked(&self.path[..open]));
-        }
-        // A relationship/connection target path (`/A.rel[/T]`): its parent is
-        // the property owning the bracket, as in C++ `SdfPath::GetParentPath`.
-        if self.path.ends_with(']') {
-            let mut nesting = 0usize;
-            for (i, byte) in self.path.bytes().enumerate().rev() {
-                match byte {
-                    b']' => nesting += 1,
-                    b'[' => {
-                        nesting -= 1;
-                        if nesting == 0 {
-                            return Some(Path::from_str_unchecked(&self.path[..i]));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            // No `[` balances the trailing `]`; the path is malformed.
-            return None;
-        }
-        if self.is_property() {
-            return Some(self.prim_path());
-        }
-        // Prim path: drop the final prim name. It is introduced either by a `/`
-        // (a child of another prim) or directly by a `}` (a child of a variant
-        // selection, `/A{v=s}B`), whichever is rightmost.
-        match self.path.rfind(['/', '}']) {
-            // Child of a variant selection: keep up to and including the `}`.
-            Some(i) if self.path.as_bytes()[i] == b'}' => Some(Path::from_str_unchecked(&self.path[..i + 1])),
-            Some(0) => Some(Path::abs_root()),
-            // Child of another prim: drop the `/` and the name.
-            Some(i) => Some(Path::from_str_unchecked(&self.path[..i])),
-            None => None,
-        }
+        self.node.parent.clone()
     }
 
     /// Iterates `self` followed by each strict ancestor, ending with the
@@ -666,18 +674,18 @@ impl Path {
     /// ""       -> None
     /// ```
     pub fn name(&self) -> Option<&str> {
-        if self.path.is_empty() || self.as_str() == "/" {
+        if self.as_str().is_empty() || self.as_str() == "/" {
             return None;
         }
         // The final prim name begins after the rightmost `/` or `}` (a child of
         // a variant selection attaches directly, `/A{v=s}B`). A path that *ends*
         // in a variant selection (`/A{v=s}`) has no prim after the `}`, so its
         // final component is the prim-plus-selection segment after the last `/`.
-        let start = self.path.rfind(['/', '}']).map_or(0, |i| i + 1);
-        if start < self.path.len() {
-            Some(&self.path[start..])
+        let start = self.as_str().rfind(['/', '}']).map_or(0, |i| i + 1);
+        if start < self.as_str().len() {
+            Some(&self.as_str()[start..])
         } else {
-            Some(self.path.rsplit_once('/').map_or(self.as_str(), |(_, name)| name))
+            Some(self.as_str().rsplit_once('/').map_or(self.as_str(), |(_, name)| name))
         }
     }
 
@@ -701,7 +709,7 @@ impl Path {
     /// "/A.attr"  -> [Prim("A")]  (remainder ".attr")
     /// ```
     pub fn components(&self) -> PathComponents<'_> {
-        PathComponents::over(self.path.strip_prefix('/').unwrap_or(&self.path))
+        PathComponents::over(self.as_str().strip_prefix('/').unwrap_or(self.as_str()))
     }
 
     /// Counts the prim-name components of this path, skipping variant
@@ -745,7 +753,7 @@ impl Path {
         if !self.has_variant_selection() {
             return self.clone();
         }
-        let mut out = String::with_capacity(self.path.len());
+        let mut out = String::with_capacity(self.as_str().len());
         let mut rest = self.as_str();
         let mut depth = 0usize;
         let mut chars = rest.char_indices();
@@ -796,11 +804,11 @@ impl Path {
     /// "/X".has_prefix("/")          -> true
     /// ```
     pub fn has_prefix(&self, prefix: &Path) -> bool {
-        let old = prefix.as_str();
-        let me = self.as_str();
-        if me == old {
+        if self == prefix {
             return true;
         }
+        let old = prefix.as_str();
+        let me = self.as_str();
         let Some(suffix) = me.strip_prefix(old) else {
             return false;
         };
@@ -832,12 +840,11 @@ impl Path {
     /// "/Other".replace_prefix("/Ref", "/MyPrim")     -> None
     /// ```
     pub fn replace_prefix(&self, old_prefix: &Path, new_prefix: &Path) -> Option<Path> {
-        let old = old_prefix.as_str();
-        let me = self.as_str();
-
-        if me == old {
+        if self == old_prefix {
             return Some(new_prefix.clone());
         }
+        let old = old_prefix.as_str();
+        let me = self.as_str();
 
         // Must start with old_prefix followed by '/', '.', or '{'. Property
         // targets in connection/relationship list ops rely on prim-prefix
@@ -920,12 +927,12 @@ impl Path {
             || self.is_abs_root()
             || self.is_property()
             || self.as_str() == "."
-            || self.path.ends_with("..")
-            || self.path.ends_with(']')
+            || self.as_str().ends_with("..")
+            || self.as_str().ends_with(']')
         {
-            return Err(fail(&self.path, "path cannot carry a variant selection"));
+            return Err(fail(self.as_str(), "path cannot carry a variant selection"));
         }
-        Ok(Path::from_str_unchecked(&format!("{}{{{set}={selection}}}", self.path)))
+        Ok(Path::from_str_unchecked(&format!("{self}{{{set}={selection}}}")))
     }
 
     /// Appends a raw variant segment (e.g. `{set=sel}`) directly to this path.
@@ -952,7 +959,7 @@ impl Path {
         }
         validate_variant_name(segment, set).map_err(fail)?;
         validate_variant_name(segment, selection).map_err(fail)?;
-        Ok(Path::from_str_unchecked(&format!("{}{segment}", self.path)))
+        Ok(Path::from_str_unchecked(&format!("{self}{segment}")))
     }
 
     /// Resolve a relative path against this path as anchor.
@@ -1008,7 +1015,7 @@ impl Path {
 
     #[inline]
     pub fn as_str(&self) -> &str {
-        &self.path
+        &self.node.text
     }
 
     /// Whether `name` is a valid prim or property identifier: non-empty,
@@ -1164,6 +1171,125 @@ impl<'a> Iterator for PathComponents<'a> {
         self.expect_slash = true;
         self.emitted = true;
         Some(PathComponent::Prim(name))
+    }
+}
+
+/// The hash a [`Node`] spelled `text` carries.
+fn hash_text(text: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Locks the shard of [`NODES`] that the node of `hash` lives in.
+fn lock_shard(hash: u64) -> MutexGuard<'static, Shard> {
+    // A shard's map indexes buckets by the low bits of a hash and tags them
+    // by the high ones. The shard is picked by bits from the middle.
+    NODES[(hash >> 32) as usize % SHARDS]
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Whether path `text` ends in a property name.
+fn ends_in_property(text: &str) -> bool {
+    let Some(pos) = text.rfind('.') else {
+        return false;
+    };
+    // The final dot must be followed by a valid property name: identifier
+    // characters plus `:` for namespaced properties like
+    // `primvars:displayColor` — the same alphabet the path validator
+    // accepts. A tail carrying structural characters (`}`, `]`) belongs to
+    // a variant selection or target path, not a property.
+    let tail = &text[pos + 1..];
+    !tail.is_empty() && tail.chars().all(|c| c == ':' || is_identifier_cont(c))
+}
+
+/// Length of the prefix of path `text` that spells [`Path::prim_path`].
+fn prim_len(text: &str) -> usize {
+    // Split at last slash.
+    // "/A/B/C.foo[target].bar:baz" will become "/A/B" and "C.foo[target].bar:baz"
+    let Some((before, after)) = text.rsplit_once('/') else {
+        // Relative single segment (no slash): strip a trailing property or
+        // variant selection. `ends_in_property` separates `Foo.bar` from a
+        // relative `..`, which has no property tail and is its own prim.
+        if ends_in_property(text)
+            && let Some(dot) = find_component_dot(text)
+        {
+            return dot;
+        }
+        if text.ends_with('}')
+            && let Some(open) = text.rfind('{')
+        {
+            return open;
+        }
+        return text.len();
+    };
+
+    // For cases like ../.foo[target].bar, just return ..
+    if after.starts_with('.') {
+        return before.len();
+    }
+
+    // Strip the trailing variant selection, keeping any earlier variants on
+    // the same component: "/A/B/C{set=sel}" => "/A/B/C" and a nested
+    // "/A{x=y}B{p=q}" => "/A{x=y}B" (the last `{` opens the trailing variant).
+    if after.ends_with('}')
+        && let Some(pos) = after.rfind('{')
+    {
+        return before.len() + pos + 1;
+    }
+
+    // The prim ends at the first dot. A path with none is a prim path.
+    find_component_dot(after).map_or(text.len(), |dot| before.len() + dot + 1)
+}
+
+/// Length of the prefix of path `text` that spells [`Path::parent`], or
+/// `None` when the path has no parent.
+fn parent_len(text: &str) -> Option<usize> {
+    if text.is_empty() || text == "/" {
+        return None;
+    }
+    // Drop a trailing `{set=sel}` variant selection.
+    if text.ends_with('}')
+        && let Some(open) = text.rfind('{')
+    {
+        return Some(open);
+    }
+    // A relationship/connection target path (`/A.rel[/T]`): its parent is
+    // the property owning the bracket, as in C++ `SdfPath::GetParentPath`.
+    if text.ends_with(']') {
+        let mut nesting = 0usize;
+        for (i, byte) in text.bytes().enumerate().rev() {
+            match byte {
+                b']' => nesting += 1,
+                b'[' => {
+                    nesting -= 1;
+                    if nesting == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        // No `[` balances the trailing `]`; the path is malformed.
+        return None;
+    }
+    if ends_in_property(text) {
+        // A malformed text whose property dot sits inside an unclosed `{` or
+        // `[` is its own prim path. It gets no parent.
+        return Some(prim_len(text)).filter(|&len| len < text.len());
+    }
+    // Prim path: drop the final prim name. It is introduced either by a `/`
+    // (a child of another prim) or directly by a `}` (a child of a variant
+    // selection, `/A{v=s}B`), whichever is rightmost.
+    match text.rfind(['/', '}']) {
+        // Child of a variant selection: keep up to and including the `}`.
+        Some(i) if text.as_bytes()[i] == b'}' => Some(i + 1),
+        // A root prim's parent is the pseudo-root.
+        Some(0) => Some(1),
+        // Child of another prim: drop the `/` and the name.
+        Some(i) => Some(i),
+        None => None,
     }
 }
 
@@ -1379,10 +1505,8 @@ impl TryFrom<&str> for Path {
 impl TryFrom<String> for Path {
     type Error = PathParseError;
 
-    /// Validates `value` and shares its existing text allocation.
     fn try_from(value: String) -> Result<Path, PathParseError> {
-        Path::validate(&value)?;
-        Ok(Path::from_text(value))
+        Path::new(&value)
     }
 }
 
@@ -1394,101 +1518,265 @@ impl TryFrom<&String> for Path {
     }
 }
 
-impl Text {
-    fn new(text: String) -> Self {
-        let mut hasher = DefaultHasher::new();
-        text.hash(&mut hasher);
-        Self {
-            hash: hasher.finish(),
-            text,
-        }
-    }
-}
-
-impl Deref for Text {
-    type Target = str;
-
-    fn deref(&self) -> &str {
-        &self.text
-    }
-}
-
-impl Hash for Text {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write_u64(self.hash);
-    }
-}
-
-impl PartialEq for Text {
-    fn eq(&self, other: &Self) -> bool {
-        self.hash == other.hash && self.text == other.text
-    }
-}
-
-impl Eq for Text {}
-
-impl PartialOrd for Text {
-    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for Text {
-    fn cmp(&self, other: &Self) -> cmp::Ordering {
-        self.text.cmp(&other.text)
-    }
-}
-
-impl fmt::Debug for Text {
+impl fmt::Debug for Node {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&self.text, f)
     }
 }
 
-impl fmt::Display for Text {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.text, f)
+impl Drop for Node {
+    fn drop(&mut self) {
+        lock_shard(self.hash).remove(self);
+    }
+}
+
+impl Shard {
+    /// The live node spelled `text`, whose hash is `hash`.
+    ///
+    /// The live nodes of that hash it reads and finds spelled otherwise go
+    /// to `others`, for the caller to drop once the shard is unlocked:
+    /// dropping a node's last reference locks its shard.
+    fn find(&self, hash: u64, text: &str, others: &mut Vec<Arc<Node>>) -> Option<Path> {
+        let mut live = |weak: &Weak<Node>| {
+            let node = weak.upgrade()?;
+            if *node.text == *text {
+                return Some(Path { node });
+            }
+            others.push(node);
+            None
+        };
+        if let Some(path) = self.nodes.get(&hash).and_then(&mut live) {
+            return Some(path);
+        }
+        self.collided.iter().find_map(live)
+    }
+
+    /// Records `node`, whose text no live node in the shard spells.
+    fn insert(&mut self, node: &Arc<Node>) {
+        let weak = Arc::downgrade(node);
+        match self.nodes.entry(node.hash) {
+            Entry::Occupied(slot) if slot.get().strong_count() > 0 => self.collided.push(weak),
+            Entry::Occupied(mut slot) => {
+                slot.insert(weak);
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(weak);
+            }
+        }
+    }
+
+    /// Forgets `node`, which is being dropped. Its entry may already be
+    /// gone, overwritten by a node of the same hash interned since it died.
+    fn remove(&mut self, node: &Node) {
+        if self
+            .nodes
+            .get(&node.hash)
+            .is_some_and(|weak| ptr::eq(weak.as_ptr(), node))
+        {
+            self.nodes.remove(&node.hash);
+        } else {
+            self.collided.retain(|weak| !ptr::eq(weak.as_ptr(), node));
+        }
+    }
+}
+
+impl Hasher for Prehashed {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, _: &[u8]) {
+        unreachable!("`Prehashed` hashes only `u64` keys");
+    }
+
+    fn write_u64(&mut self, hash: u64) {
+        self.0 = hash;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::thread;
 
     use crate::Result;
 
     use super::*;
 
-    /// The empty and absolute root paths share one text each, from every
+    /// The empty and absolute root paths share one node each, from every
     /// constructor and derivation that reaches them.
     #[test]
     fn sentinels_shared() {
-        assert!(Arc::ptr_eq(&Path::default().path, &Path::default().path));
-        assert!(Arc::ptr_eq(&Path::abs_root().path, &Path::abs_root().path));
+        assert!(Arc::ptr_eq(&Path::default().node, &Path::default().node));
+        assert!(Arc::ptr_eq(&Path::abs_root().node, &Path::abs_root().node));
         let root = Path::new("/Root").unwrap();
-        assert!(Arc::ptr_eq(&root.parent().unwrap().path, &Path::abs_root().path));
+        assert!(Arc::ptr_eq(&root.parent().unwrap().node, &Path::abs_root().node));
         assert!(Arc::ptr_eq(
-            &Path::new(".bar").unwrap().prim_path().path,
-            &Path::default().path
+            &Path::new(".bar").unwrap().prim_path().node,
+            &Path::default().node
         ));
     }
 
+    /// Paths spelled the same share one node however they are made.
     #[test]
-    fn clone_shares_text() {
-        let path = Path::new("/Root/Branch").unwrap();
-        let clone = path.clone();
-        assert!(Arc::ptr_eq(&path.path, &clone.path));
-        assert_eq!(clone.append_property("size").unwrap().as_str(), "/Root/Branch.size");
-        assert_eq!(clone.append_path("Leaf").unwrap().as_str(), "/Root/Branch/Leaf");
-        assert_eq!(path.as_str(), "/Root/Branch");
-        let text = String::from("/Root/Branch");
-        let allocation = text.as_ptr();
-        let independent = Path::try_from(text).unwrap();
-        assert_eq!(independent.as_str().as_ptr(), allocation);
-        assert_eq!(path, independent);
+    fn interned_once() {
+        let path = Path::new("/Interned/Branch").unwrap();
+        assert!(Arc::ptr_eq(&path.node, &path.clone().node));
+        let parsed = Path::try_from(String::from("/Interned/Branch")).unwrap();
+        let derived = Path::new("/Interned").unwrap().append_path("Branch").unwrap();
+        let stripped = Path::new("/Interned/Branch.size").unwrap().prim_path();
+        for other in [&parsed, &derived, &stripped] {
+            assert!(Arc::ptr_eq(&path.node, &other.node));
+        }
         let mut paths = HashSet::new();
         paths.insert(path);
-        assert!(paths.contains(&independent));
+        assert!(paths.contains(&derived));
+    }
+
+    /// A node holds its parent's node, which the parent's own constructors
+    /// then return.
+    #[test]
+    fn parent_linked() {
+        let attr = Path::new("/Linked{v=s}Child.rel[/T].attr").unwrap();
+        let chain: Vec<_> = attr.ancestors().collect();
+        assert_eq!(
+            chain.iter().map(Path::as_str).collect::<Vec<_>>(),
+            [
+                "/Linked{v=s}Child.rel[/T].attr",
+                "/Linked{v=s}Child.rel[/T]",
+                "/Linked{v=s}Child.rel",
+                "/Linked{v=s}Child",
+                "/Linked{v=s}",
+                "/Linked",
+                "/",
+            ]
+        );
+        for path in &chain {
+            assert!(Arc::ptr_eq(&path.node, &Path::new(path.as_str()).unwrap().node));
+        }
+        // The child keeps its parent alive. Dropping the child drops the
+        // parent too.
+        let child = Path::new("/Orphan/Child").unwrap();
+        let parent = Arc::downgrade(&child.parent().unwrap().node);
+        assert!(parent.upgrade().is_some());
+        drop(child);
+        assert!(parent.upgrade().is_none());
+    }
+
+    /// Whether the table holds an entry for the node spelled `text`.
+    fn entry(text: &str) -> bool {
+        let hash = hash_text(text);
+        lock_shard(hash).nodes.contains_key(&hash)
+    }
+
+    /// A node's last drop removes its entry, and its parent's when that was
+    /// the parent's last reference.
+    #[test]
+    fn dropped_node_removed() {
+        let path = Path::new("/Removed/Child.attr").unwrap();
+        assert!(entry("/Removed/Child.attr") && entry("/Removed/Child"));
+        let parent = path.parent().unwrap();
+        drop(path);
+        assert!(!entry("/Removed/Child.attr"));
+        assert!(entry("/Removed/Child"));
+        drop(parent);
+        assert!(!entry("/Removed/Child") && !entry("/Removed"));
+        assert_eq!(
+            Path::new("/Removed/Child.attr").unwrap().as_str(),
+            "/Removed/Child.attr"
+        );
+    }
+
+    /// Nodes whose hashes collide are told apart by their text, each found
+    /// and removed on its own.
+    #[test]
+    fn collided_hashes() {
+        // A hash neither text has, which no interned path reaches.
+        let hash = 0x5eed_0000_c011_1de5;
+        let node = |text: &str| {
+            let node = Arc::new(Node {
+                text: text.into(),
+                hash,
+                parent: None,
+                property: false,
+            });
+            lock_shard(hash).insert(&node);
+            node
+        };
+        let (first, second) = (node("/CollideA"), node("/CollideB"));
+        let find = |text: &str| {
+            let mut others = Vec::new();
+            let found = lock_shard(hash).find(hash, text, &mut others);
+            (found.map(|path| path.node), others.len())
+        };
+        let (found, others) = find("/CollideB");
+        assert!(found.is_some_and(|found| Arc::ptr_eq(&found, &second)));
+        assert_eq!(others, 1);
+        assert!(find("/CollideA").0.is_some_and(|found| Arc::ptr_eq(&found, &first)));
+        assert!(find("/CollideC").0.is_none());
+        drop(first);
+        assert!(find("/CollideA").0.is_none());
+        assert!(find("/CollideB").0.is_some());
+        drop(second);
+        let shard = lock_shard(hash);
+        assert!(!shard.nodes.contains_key(&hash));
+        assert!(shard.collided.iter().all(|weak| weak.strong_count() > 0));
+    }
+
+    /// Threads interning and dropping the same paths over and over leave no
+    /// entry behind.
+    #[test]
+    fn churn_across_threads() {
+        let texts: Vec<_> = (0..64).map(|i| format!("/Churn/P{}/Q{i}.attr", i % 5)).collect();
+        thread::scope(|threads| {
+            for _ in 0..4 {
+                threads.spawn(|| {
+                    for _ in 0..200 {
+                        let paths: Vec<_> = texts.iter().map(|text| Path::new(text).unwrap()).collect();
+                        assert!(paths.iter().zip(&texts).all(|(path, text)| path.as_str() == text));
+                    }
+                });
+            }
+        });
+        assert!(!texts.iter().any(|text| entry(text)) && !entry("/Churn"));
+    }
+
+    /// Threads interning the same paths at once agree on one node each.
+    #[test]
+    fn interned_across_threads() {
+        let texts: Vec<_> = (0..256).map(|i| format!("/Threaded/P{}/Q{i}.attr", i % 7)).collect();
+        let interned: Vec<Vec<Path>> = thread::scope(|threads| {
+            let handles: Vec<_> = (0..4)
+                .map(|_| threads.spawn(|| texts.iter().map(|text| Path::new(text).unwrap()).collect()))
+                .collect();
+            handles.into_iter().map(|handle| handle.join().unwrap()).collect()
+        });
+        for paths in &interned[1..] {
+            for (path, first) in paths.iter().zip(&interned[0]) {
+                assert!(Arc::ptr_eq(&path.node, &first.node));
+                assert!(Arc::ptr_eq(&path.parent().unwrap().node, &first.parent().unwrap().node));
+            }
+        }
+    }
+
+    /// Ordering compares text. Equal paths hash alike.
+    #[test]
+    fn order_by_text() {
+        let mut paths: Vec<_> = ["/B", "/A/C", "/A", "/A.x", "/"]
+            .into_iter()
+            .map(|text| Path::new(text).unwrap())
+            .collect();
+        paths.sort();
+        assert_eq!(
+            paths.iter().map(Path::as_str).collect::<Vec<_>>(),
+            ["/", "/A", "/A.x", "/A/C", "/B"]
+        );
+        let hash = |path: &Path| {
+            let mut hasher = DefaultHasher::new();
+            path.hash(&mut hasher);
+            hasher.finish()
+        };
+        assert_eq!(hash(&paths[1]), hash(&Path::new("/A").unwrap()));
     }
 
     #[cfg(feature = "serde")]
@@ -1534,7 +1822,7 @@ mod tests {
     /// Builds a `Path` directly from `path`, skipping validation — for
     /// exercising lenient read-side behavior on malformed input.
     fn raw(path: &str) -> Path {
-        Path::from_text(path.to_owned())
+        Path::intern(path)
     }
 
     #[test]
