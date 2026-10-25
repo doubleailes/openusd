@@ -95,16 +95,17 @@ pub trait StageSink {
     }
 
     /// Observe a payload load/unload change (C++ `UsdNotice::ObjectsChanged`
-    /// fired by `Load`/`Unload`/`LoadAndUnload`/`SetLoadRules`, treating every
-    /// reported path as a full resync).
+    /// fired by `Load`/`Unload`/`LoadAndUnload`/`SetLoadRules`).
     ///
-    /// `resynced` is the bounded set of paths
-    /// [`Stage::load`]/[`Stage::unload`]/[`Stage::load_and_unload`]/
-    /// [`Stage::set_load_rules`] used to invalidate the cache, together with the
-    /// prototype roots retired with them, minimal in ancestors — never empty,
-    /// since a no-op edit fires no notification at all.
-    fn load_rules_changed(&self, stage: &Stage, resynced: &[sdf::Path]) {
-        let _ = (stage, resynced);
+    /// `resynced` is every subtree the edit can restructure: each path whose
+    /// load rule changed, each ancestor whose own payload the edit included or
+    /// excluded, and the prototype roots retired with them, minimal in
+    /// ancestors — never empty, since a no-op edit fires no notification at
+    /// all. `recomposed` is every other ancestor the edit recomposed, whose
+    /// children and properties are unchanged; none lies beneath a `resynced`
+    /// path.
+    fn load_rules_changed(&self, stage: &Stage, resynced: &[sdf::Path], recomposed: &[sdf::Path]) {
+        let _ = (stage, resynced, recomposed);
     }
 }
 
@@ -601,7 +602,7 @@ pub(super) fn keep_ancestors(paths: &mut Vec<sdf::Path>) {
 /// Whether `path` lies at or beneath one of `covering`'s entries, which report
 /// their whole subtree. Both must be in the same namespace for the answer to
 /// mean anything.
-fn is_covered(covering: &[sdf::Path], path: &sdf::Path) -> bool {
+pub(super) fn is_covered(covering: &[sdf::Path], path: &sdf::Path) -> bool {
     covering.iter().any(|prefix| path.has_prefix(prefix))
 }
 

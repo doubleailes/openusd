@@ -1085,26 +1085,27 @@ impl StageComposition {
         &self,
         edit: impl FnOnce(&mut pcp::LoadRules),
         hooks: &dyn CompositionHooks,
-    ) -> Vec<sdf::Path> {
+    ) -> pcp::LoadRulesChange {
         // Drain before reading: a queued edit's notification may itself install
         // load rules, and `edit` is applied to whatever this read returns, so a
         // pre-drain snapshot would overwrite that change on the way back out.
         self.process_pending(hooks);
         let mut rules = self.settled_cache().load_rules().clone();
         edit(&mut rules);
-        let victims = self.swap_load_rules(rules, hooks);
+        let change = self.swap_load_rules(rules, hooks);
         self.reclaim_stale_stacks();
-        victims
+        change
     }
 
     /// Installs `rules` in place of the current table, returning the bounded set
-    /// of paths whose cached index was dropped.
+    /// of paths whose cached index was dropped, grouped by what the change can
+    /// do to each.
     ///
     /// Drains first so the mutation recomposes against a current graph and
     /// cache, matching [`apply_mute`](Self::apply_mute). Reclaims nothing: this
     /// is also the transient swap behind the loadability walk, which must leave
     /// the payload-target stacks it composes untouched.
-    pub(super) fn swap_load_rules(&self, rules: pcp::LoadRules, hooks: &dyn CompositionHooks) -> Vec<sdf::Path> {
+    pub(super) fn swap_load_rules(&self, rules: pcp::LoadRules, hooks: &dyn CompositionHooks) -> pcp::LoadRulesChange {
         self.process_pending(hooks);
         self.settled_cache_mut().set_load_rules(rules)
     }

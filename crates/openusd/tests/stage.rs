@@ -29,7 +29,7 @@ struct RecordingSink {
     after: Option<Box<dyn Fn(&Stage, &CommittedChange<'_>)>>,
     edit_target: Option<Box<dyn Fn(&Stage)>>,
     muting: Option<Box<dyn Fn(&Stage, &str, bool, &[sdf::Path])>>,
-    load_rules: Option<Box<dyn Fn(&Stage, &[sdf::Path])>>,
+    load_rules: Option<Box<dyn Fn(&Stage, &[sdf::Path], &[sdf::Path])>>,
 }
 
 impl StageSink for RecordingSink {
@@ -48,9 +48,9 @@ impl StageSink for RecordingSink {
             f(stage, layer, muted, resynced);
         }
     }
-    fn load_rules_changed(&self, stage: &Stage, resynced: &[sdf::Path]) {
+    fn load_rules_changed(&self, stage: &Stage, resynced: &[sdf::Path], recomposed: &[sdf::Path]) {
         if let Some(f) = &self.load_rules {
-            f(stage, resynced);
+            f(stage, resynced, recomposed);
         }
     }
 }
@@ -155,8 +155,10 @@ struct Notices {
     asset_paths_resynced: Vec<sdf::Path>,
     /// What a layer mute/unmute invalidated.
     muting: Vec<sdf::Path>,
-    /// What a load-rules edit invalidated.
+    /// What a load-rules edit can restructure.
     load_rules: Vec<sdf::Path>,
+    /// What a load-rules edit recomposed without restructuring.
+    load_rules_recomposed: Vec<sdf::Path>,
 }
 
 /// Installs a sink recording every channel, for tests asserting exactly what an
@@ -177,9 +179,13 @@ fn capture_notices(stage: &Stage) -> Rc<RefCell<Notices>> {
                 muting.borrow_mut().muting.extend(resynced.iter().cloned());
             },
         )),
-        load_rules: Some(Box::new(move |_stage: &Stage, resynced: &[sdf::Path]| {
-            load_rules.borrow_mut().load_rules.extend(resynced.iter().cloned());
-        })),
+        load_rules: Some(Box::new(
+            move |_stage: &Stage, resynced: &[sdf::Path], recomposed: &[sdf::Path]| {
+                let mut n = load_rules.borrow_mut();
+                n.load_rules.extend(resynced.iter().cloned());
+                n.load_rules_recomposed.extend(recomposed.iter().cloned());
+            },
+        )),
         ..Default::default()
     });
     notices
@@ -3600,7 +3606,7 @@ fn load_noop_fires_no_notification() -> Result<()> {
     let _token = {
         let calls = calls.clone();
         stage.add_sink(RecordingSink {
-            load_rules: Some(Box::new(move |_stage, _resynced| {
+            load_rules: Some(Box::new(move |_stage, _resynced, _recomposed| {
                 *calls.borrow_mut() += 1;
             })),
             ..Default::default()
@@ -3643,6 +3649,46 @@ fn write_nested_payload_scene(dir: &std::path::Path) -> Result<std::path::PathBu
         "#usda 1.0\n(\n    defaultPrim = \"Deep\"\n)\ndef \"Deep\" {\n    custom double x = 42\n}\n",
     )?;
     Ok(root)
+}
+
+/// Loading a payload under `LoadNone` resyncs the loaded path alone; its
+/// payload-free parent is reported as recomposed, so a sibling of the loaded
+/// prim is left out of the resync.
+#[test]
+fn load_resyncs_loaded_path() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = write_nested_payload_scene(dir.path())?;
+    let stage = Stage::builder()
+        .load(InitialLoadSet::LoadNone)
+        .open(root.to_str().unwrap())?;
+    let notices = capture_notices(&stage);
+
+    stage.load("/World/A", LoadPolicy::WithDescendants)?;
+
+    let notices = notices.borrow();
+    assert_eq!(notices.load_rules, paths(&["/World/A"]));
+    assert_eq!(notices.load_rules_recomposed, paths(&["/World"]));
+    Ok(())
+}
+
+/// An ancestor whose own payload the edit includes resyncs, since that payload
+/// can bring new children; the loaded path beneath it is covered.
+#[test]
+fn load_resyncs_payload_ancestor() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = write_nested_payload_scene(dir.path())?;
+    let stage = Stage::builder()
+        .load(InitialLoadSet::LoadNone)
+        .open(root.to_str().unwrap())?;
+    let notices = capture_notices(&stage);
+
+    stage.load("/World/A/Deep", LoadPolicy::WithDescendants)?;
+
+    let notices = notices.borrow();
+    assert_eq!(notices.load_rules, paths(&["/World/A"]));
+    assert_eq!(notices.load_rules_recomposed, paths(&["/World"]));
+    assert!(stage.prim("/World/A/Deep")?.is_loaded()?);
+    Ok(())
 }
 
 /// `find_loadable` discovers every payload-carrying prim under `root`, even

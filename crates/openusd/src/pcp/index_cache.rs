@@ -2196,9 +2196,8 @@ impl IndexCache {
 
     /// Drops each victim prim index and the prototypes its drop touches — the tail
     /// shared by [`drop_indices_touching_layers`](Self::drop_indices_touching_layers),
-    /// [`invalidate_muting`](Self::invalidate_muting),
-    /// [`set_load_rules`](Self::set_load_rules), and the `expressionVariables`
-    /// delta path (`change::apply_vars_deltas`).
+    /// [`invalidate_muting`](Self::invalidate_muting), and the
+    /// `expressionVariables` delta path (`change::apply_vars_deltas`).
     ///
     /// Returns everything the drop invalidated: `victims` and the prototype roots
     /// retired with them, which no walk over `victims` could reach (see
