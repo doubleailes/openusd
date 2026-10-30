@@ -54,7 +54,7 @@ use super::composition::{self, PendingEdit, StageComposition};
 
 use super::authoring::{Operation, PlanStamp, PlanState, PrimOp};
 use super::interp::{self, InterpolationType};
-use super::sink::{PendingChange, Provenance, StageSink, StageSinkId, keep_ancestors};
+use super::sink::{PendingChange, Provenance, StageSink, StageSinkId, is_covered, keep_ancestors};
 use super::{PrimTypeId, PrimTypeInfo, SchemaRegistry, Schematics, StagePopulationMask};
 
 bitflags! {
@@ -2562,14 +2562,14 @@ impl Stage {
         let Some(path) = Self::normalize_load_target(path) else {
             return;
         };
-        let victims = self.composition.install_load_rules(
+        let change = self.composition.install_load_rules(
             move |rules| match policy {
                 LoadPolicy::WithDescendants => rules.load_with_descendants(path),
                 LoadPolicy::WithoutDescendants => rules.load_without_descendants(path),
             },
             self,
         );
-        self.notify_load_rules_changed(victims);
+        self.notify_load_rules_changed(change);
     }
 
     /// Unloads `path`'s payload and everything beneath it (C++
@@ -2585,10 +2585,10 @@ impl Stage {
         let Some(path) = Self::normalize_load_target(path) else {
             return;
         };
-        let victims = self
+        let change = self
             .composition
             .install_load_rules(move |rules| rules.unload(path), self);
-        self.notify_load_rules_changed(victims);
+        self.notify_load_rules_changed(change);
     }
 
     /// Loads every path in `to_load` (with `policy`) and unloads every path
@@ -2620,7 +2620,7 @@ impl Stage {
             )
             .filter_map(Result::transpose)
             .collect::<Result<_, sdf::PathParseError>>()?;
-        let victims = self.composition.install_load_rules(
+        let change = self.composition.install_load_rules(
             |rules| {
                 for path in to_unload {
                     rules.unload(path);
@@ -2634,7 +2634,7 @@ impl Stage {
             },
             self,
         );
-        self.notify_load_rules_changed(victims);
+        self.notify_load_rules_changed(change);
         Ok(())
     }
 
@@ -2650,8 +2650,8 @@ impl Stage {
     /// use, not a blunt whole-stage drop, since the affected set is already
     /// provably sufficient (see [`pcp::LoadRules`]'s module documentation).
     pub fn set_load_rules(&self, rules: pcp::LoadRules) {
-        let victims = self.composition.install_load_rules(|current| *current = rules, self);
-        self.notify_load_rules_changed(victims);
+        let change = self.composition.install_load_rules(|current| *current = rules, self);
+        self.notify_load_rules_changed(change);
     }
 
     /// Every prim below `root` (inclusive) that carries a payload arc, loaded
@@ -2751,17 +2751,33 @@ impl Stage {
         (!pcp::is_prototype_namespace(&path)).then_some(path)
     }
 
-    /// Fires [`StageSink::load_rules_changed`] with the paths the edit
-    /// invalidated, reduced to the subtrees they stand for, after the cache
-    /// borrow is released. A no-op edit invalidates nothing and reports nothing.
-    fn notify_load_rules_changed(&self, mut resynced: Vec<sdf::Path>) {
-        let sinks = self.sinks.borrow();
-        if resynced.is_empty() || sinks.is_empty() {
+    /// Fires [`StageSink::load_rules_changed`] for what the edit invalidated,
+    /// after the cache borrow is released. An ancestor whose own payload
+    /// inclusion flipped resyncs only when it carries a payload, the one case
+    /// where that flip reshapes its subtree, or when that cannot be read;
+    /// otherwise it joins the recomposed paths. A recomposed path a resync
+    /// covers is left out, and a no-op edit reports nothing.
+    fn notify_load_rules_changed(&self, change: pcp::LoadRulesChange) {
+        if change.is_empty() || self.sinks.borrow().is_empty() {
             return;
         }
+        let pcp::LoadRulesChange {
+            mut resynced,
+            flipped,
+            mut recomposed,
+        } = change;
+        for path in flipped {
+            if super::prim::has_payload(self, &path).unwrap_or(true) {
+                resynced.push(path);
+            } else {
+                recomposed.push(path);
+            }
+        }
         keep_ancestors(&mut resynced);
-        for sink in sinks.iter() {
-            sink.load_rules_changed(self, &resynced);
+        recomposed.retain(|path| !is_covered(&resynced, path));
+        recomposed.sort();
+        for sink in self.sinks.borrow().iter() {
+            sink.load_rules_changed(self, &resynced, &recomposed);
         }
     }
 
