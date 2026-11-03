@@ -14157,7 +14157,7 @@ fn resyncs_of(stage: &Stage, edit: impl FnOnce() -> Result<()>) -> Result<Vec<sd
 
 /// Sets `field` on the prim spec at `path` in `stage`'s root layer, as a layer
 /// diff replays it (Mantle's IPR mirror replays a cooked layer this way).
-fn set_root_layer_field(stage: &Stage, path: &str, field: &str, value: sdf::Value) -> Result<()> {
+fn set_root_layer_field(stage: &Stage, path: &str, field: &str, value: vt::Value) -> Result<()> {
     let root = stage.root_layer().identifier().to_owned();
     let diff = usd::Diff {
         edits: vec![usd::Edit::SetField {
@@ -14186,7 +14186,7 @@ fn children_reorder_resyncs_the_prim() -> Result<()> {
             &stage,
             "/W",
             "primChildren",
-            sdf::Value::TokenVec(vec!["b".into(), "a".into()]),
+            vt::Value::TokenVec(vec!["b".into(), "a".into()]),
         )
     })?;
     let children: Vec<String> = stage
@@ -14212,7 +14212,7 @@ fn property_reorder_resyncs_the_prim() -> Result<()> {
             &stage,
             "/W",
             "propertyChildren",
-            sdf::Value::TokenVec(vec!["y".into(), "x".into()]),
+            vt::Value::TokenVec(vec!["y".into(), "x".into()]),
         )
     })?;
     assert!(resynced.contains(&sdf::path("/W")?), "{resynced:?}");
